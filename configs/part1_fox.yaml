@@ -1,0 +1,21 @@
+# OctNeRF Part 1 配置 - 2D 图像拟合
+# 使用 Fourier 位置编码进行 2D 图像拟合实验
+
+# 模型配置
+mode: part1_fourier # 模式：part1_fourier / part2_nerf / part3_octree
+L_embed: 15 # 位置编码频率数量（可调整: 5, 10, 15）
+hidden_dim: 512 # MLP 隐藏层维度（可调整: 128, 256, 512）
+output_dim: 3 # 输出维度（RGB = 3）
+
+# 训练配置
+epochs: 5000 # 训练迭代次数
+learning_rate: 1e-3 # 学习率
+batch_size: null # null 表示全图训练
+
+# 数据配置
+image_path: data/fox.jpg # 输入图像路径
+image_size: 400 # 调整后的图像尺寸
+
+# 输出配置
+log_dir: output/ # 输出目录
+save_every: 500 # 每 N 步保存一次中间结果
