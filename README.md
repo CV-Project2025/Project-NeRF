@@ -6,7 +6,7 @@
 
 #### 2.项目报告：
 
-[milestone](https://latex.pku.edu.cn/project/6954fa6e57c9c512c3b063aa)
+[milestone](https://latex.pku.edu.cn/2875718687fgrkxchnkdhy#31501e)
 
 ## 快速开始
 
@@ -27,7 +27,7 @@ pip install -r requirements.txt
 
 #### 3. 准备数据
 
-将您的图像放入 `data/` 目录，例如 `data/fox.jpg`，可从 [网盘] (https://disk.pku.edu.cn/link/AAF9F7FDBF0428495A933F2CAFB52E944B)获取。
+将您的图像放入 `data/` 目录，例如 `data/fox.jpg`，可从 [网盘](https://disk.pku.edu.cn/link/AAF9F7FDBF0428495A933F2CAFB52E944B) 获取。
 
 #### 4. 直接运行 Part 1：2D 图像拟合
 
