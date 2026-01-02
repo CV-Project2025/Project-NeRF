@@ -1,4 +1,4 @@
-## 说明
+## 资源说明
 
 #### 1.项目网盘：
 
@@ -10,29 +10,38 @@
 
 ## 快速开始
 
-#### 1. 环境配置
+#### 1. 克隆代码库
+
+```bash
+git clone https://github.com/CV-Project2025/Project-NeRF
+cd Project-NeRF
+```
+
+#### 2. 环境配置
 
 ```bash
 python3 -m venv .venv
-source venv/bin/activate
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-#### 2. 准备数据
+#### 3. 准备数据
 
-将您的图像放入 `data/` 目录，例如 `data/fox.jpg`，可从[网盘](https://disk.pku.edu.cn/link/AAF9F7FDBF0428495A933F2CAFB52E944B)获取。
+将您的图像放入 `data/` 目录，例如 `data/fox.jpg`，可从 [网盘] (https://disk.pku.edu.cn/link/AAF9F7FDBF0428495A933F2CAFB52E944B)获取。
 
-#### 3. 运行 Part 1：2D 图像拟合
+#### 4. 直接运行 Part 1：2D 图像拟合
 
 ```bash
 python3 run.py --image data/fox.jpg --config configs/part1.yaml
 ```
 
-训练完成后，中间结果（调整 [配置](configs/part1.yaml) 里面的`save_every`）会保存到 output/logs/steps/ 目录，最终结果会保存到 output/result_part1.png
+- 运行 `python3 run.py -h` 查看参数说明
 
-终端会输出最终的 PSNR 值
+- 训练完成后，中间结果（调整 [配置](configs/part1.yaml) 里面的`save_every`）会保存到 output/logs/steps/ 目录，最终结果会保存到 `output/result_part1.png`
 
-#### 4. 实验参数调整
+- 终端会输出最终的 PSNR 值（**< 30 dB**: 质量较差， **30-40 dB**: 质量良好， **> 40 dB**: 质量优秀）
+
+#### 5. 实验参数调整
 
 **编辑 [configs/part1.yaml](configs/part1.yaml) 进行参数调整**，配置文件包含：
 
@@ -42,20 +51,12 @@ python3 run.py --image data/fox.jpg --config configs/part1.yaml
 - **网络深度**：`num_layers: 2, 3, 5, 8`
 - **训练参数**：`epochs`, `learning_rate`
 
-**推荐实验组合**（配置文件中有详细说明）：
+**推荐实验组合**：
 
 1. **验证位置编码**：对比 `use_positional_encoding: false` vs `true`
 2. **频率扫描**：测试 `L_embed = [5, 10, 15, 20]`
 3. **网络容量**：测试 `hidden_dim = [128, 256, 512]`
 4. **深度实验**：修改 `num_layers = [2, 3, 5, 8]` 测试不同层数
-
-#### 5. 查看 PSNR 指标
-
-PSNR (Peak Signal-to-Noise Ratio) 是图像质量评估指标，数值越高表示重建质量越好：
-
-- **< 30 dB**: 质量较差
-- **30-40 dB**: 质量良好
-- **> 40 dB**: 质量优秀
 
 ## 项目架构
 
