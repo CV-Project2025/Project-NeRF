@@ -25,31 +25,29 @@ pip install -r requirements.txt
 #### 3. 运行 Part 1：2D 图像拟合
 
 ```bash
-python3 run.py --image data/fox.jpg --config configs/part1_fox.yaml
+python3 run.py --image data/fox.jpg --config configs/part1.yaml
 ```
 
-训练完成后，结果会保存到 output/result_part1.png
+训练完成后，中间结果（调整 [配置](configs/part1.yaml) 里面的`save_every`）会保存到 output/logs/steps/ 目录，最终结果会保存到 output/result_part1.png
 
 终端会输出最终的 PSNR 值
 
 #### 4. 实验参数调整
 
-编辑 `configs/part1_fox.yaml` 来尝试不同配置：
+**编辑 [configs/part1.yaml](configs/part1.yaml) 进行参数调整**，配置文件包含：
 
-**实验建议**：
+- **位置编码开关**：`use_positional_encoding: true/false`
+- **频率数量**：`L_embed: 5, 10, 15, 20`
+- **隐藏层维度**：`hidden_dim: 128, 256, 512, 1024`
+- **网络深度**：`num_layers: 2, 3, 5, 8`
+- **训练参数**：`epochs`, `learning_rate`
 
-- **无位置编码**: 将 `L_embed` 设为 0（需修改代码）
-  - _原因_：对比基线，验证位置编码的必要性
-  - _现象_：无编码时图像会模糊，无法捕捉高频细节（如边缘、纹理）
-- **不同频率**: 尝试 `L_embed = 5, 10, 15`
-  - _原因_：L 控制频率范围，影响能表示的细节层次
-  - _现象_：L 太小 → 细节丢失；L 太大 → 可能过拟合/训练不稳定
-- **网络深度**: 修改 `decoders.py` 中的层数
-  - _原因_：更深网络有更强表达能力，但训练更困难
-  - _建议_：尝试 2 层、3 层（当前）、5 层
-- **隐藏层大小**: 尝试 `hidden_dim = 128, 256, 512`
-  - _原因_：控制网络容量，影响拟合能力和训练速度
-  - _权衡_：小 → 训练快但可能欠拟合；大 → 效果好但训练慢
+**推荐实验组合**（配置文件中有详细说明）：
+
+1. **验证位置编码**：对比 `use_positional_encoding: false` vs `true`
+2. **频率扫描**：测试 `L_embed = [5, 10, 15, 20]`
+3. **网络容量**：测试 `hidden_dim = [128, 256, 512]`
+4. **深度实验**：修改 `num_layers = [2, 3, 5, 8]` 测试不同层数
 
 #### 5. 查看 PSNR 指标
 
