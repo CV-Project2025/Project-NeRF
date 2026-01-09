@@ -27,7 +27,7 @@ pip install -r requirements.txt
 
 #### 3. 准备数据（Part 1）
 
-将您的图像放入 `data/` 目录，例如 `data/fox.jpg`，可从 [网盘] (https://disk.pku.edu.cn/link/AAF9F7FDBF0428495A933F2CAFB52E944B)获取。
+将您的图像放入 `data/` 目录，例如 `data/fox.jpg`，可从 [网盘](https://disk.pku.edu.cn/link/AAF9F7FDBF0428495A933F2CAFB52E944B) 获取。
 
 #### 4. 直接运行 Part 1：2D 图像拟合
 

@@ -15,16 +15,43 @@ import yaml
 from src.core import NeuralField
 from src.dataset import BlenderDataset
 from src.renderer import render_image, render_rays
-from src.utils import compute_psnr, compute_psnr_torch
+from src.utils import compute_psnr, compute_psnr_torch, render_image_safe
 
 
-def get_2d_data(path, max_size=400):
-    img = Image.open(path).convert("RGB")
+def run_part1(cfg, args):
+    """Part 1: 2D 图像拟合"""
+
+    # 参数对比相关
+    epochs = cfg["epochs"]
+    learning_rate = cfg["learning_rate"]
+    batch_size = cfg.get("batch_size", None)
+    image_size = cfg.get("image_size", 400)
+    log_dir = cfg.get("log_dir", "output/")
+    save_every = cfg.get("save_every", 500)
+    output_dim = cfg["output_dim"]
+    def ensure_list(value):
+        if isinstance(value, (list, tuple)):
+            return list(value)
+        return [value]
+    use_pe_list = ensure_list(cfg.get("use_positional_encoding", True))
+    l_embed_list = ensure_list(cfg["L_embed"])
+    hidden_dim_list = ensure_list(cfg["hidden_dim"])
+    num_layers_list = ensure_list(cfg.get("num_layers", 3))
+    param_combos = list(
+        itertools.product(use_pe_list, l_embed_list, hidden_dim_list, num_layers_list)
+    )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f">>> 使用设备: {device}")
+
+    # 加载并处理2D图像
+    img = Image.open(args.image).convert("RGB")
     w_orig, h_orig = img.size
-    scale = min(max_size / w_orig, max_size / h_orig)
+    scale = min(image_size / w_orig, image_size / h_orig)
     new_w, new_h = int(w_orig * scale), int(h_orig * scale)
     img = img.resize((new_w, new_h), Image.LANCZOS)
-
+    
+    # 生成归一化坐标网格和颜色
     img_np = np.array(img) / 255.0
     h, w, _ = img_np.shape
     coords = torch.stack(
@@ -33,37 +60,7 @@ def get_2d_data(path, max_size=400):
         ),
         dim=-1,
     ).reshape(-1, 2)
-    rgb = torch.tensor(img_np.reshape(-1, 3), dtype=torch.float32)
-    return coords, rgb, h, w
-
-
-def run_part1(cfg, args):
-    epochs = cfg["epochs"]
-    learning_rate = cfg["learning_rate"]
-    batch_size = cfg.get("batch_size", None)
-    image_size = cfg.get("image_size", 400)
-    log_dir = cfg.get("log_dir", "output/")
-    save_every = cfg.get("save_every", 500)
-    output_dim = cfg["output_dim"]
-
-    def ensure_list(value):
-        if isinstance(value, (list, tuple)):
-            return list(value)
-        return [value]
-
-    use_pe_list = ensure_list(cfg.get("use_positional_encoding", True))
-    l_embed_list = ensure_list(cfg["L_embed"])
-    hidden_dim_list = ensure_list(cfg["hidden_dim"])
-    num_layers_list = ensure_list(cfg.get("num_layers", 3))
-
-    param_combos = list(
-        itertools.product(use_pe_list, l_embed_list, hidden_dim_list, num_layers_list)
-    )
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f">>> 使用设备: {device}")
-
-    coords, gt_rgb, h, w = get_2d_data(args.image, max_size=image_size)
+    gt_rgb = torch.tensor(img_np.reshape(-1, 3), dtype=torch.float32)
     coords, gt_rgb = coords.to(device), gt_rgb.to(device)
 
     os.makedirs(log_dir, exist_ok=True)
@@ -121,11 +118,14 @@ def run_part1(cfg, args):
             model = NeuralField(config).to(device)
             optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
+            # 训练循环
             for i in tqdm(range(epochs)):
                 if batch_size is None:
+                    # 全图训练
                     pred_rgb = model(coords)
                     loss = loss_fn(pred_rgb, gt_rgb)
                 else:
+                    # 随机批量采样
                     indices = torch.randint(0, total_pixels, (batch_size,), device=device)
                     batch_coords = coords[indices]
                     batch_gt_rgb = gt_rgb[indices]
@@ -136,6 +136,7 @@ def run_part1(cfg, args):
                 loss.backward()
                 optimizer.step()
 
+                # 定期保存中间结果
                 if save_intermediate and (i + 1) % save_every == 0:
                     with torch.no_grad():
                         intermediate_img = model(coords).cpu().numpy().reshape(h, w, 3)
@@ -144,6 +145,7 @@ def run_part1(cfg, args):
                         intermediate_img,
                     )
 
+            # 训练完成，生成最终结果
             with torch.no_grad():
                 final_pred = model(coords)
                 final_img = final_pred.cpu().numpy().reshape(h, w, 3)
@@ -176,69 +178,40 @@ def run_part1(cfg, args):
             print(f">>> Done! Final PSNR: {final_psnr:.2f} dB")
 
 
-def render_image_safe(
-    model,
-    rays_o,
-    rays_d,
-    near,
-    far,
-    n_samples,
-    chunk,
-    white_bkgd,
-):
-    chunk_size = int(chunk)
-    while True:
-        try:
-            return render_image(
-                model=model,
-                rays_o=rays_o,
-                rays_d=rays_d,
-                near=near,
-                far=far,
-                n_samples=n_samples,
-                chunk=chunk_size,
-                white_bkgd=white_bkgd,
-            )
-        except torch.cuda.OutOfMemoryError:
-            if not torch.cuda.is_available():
-                raise
-            if chunk_size <= 1024:
-                raise
-            torch.cuda.empty_cache()
-            chunk_size = max(chunk_size // 2, 1024)
-            print(f">>> CUDA OOM, reducing render chunk to {chunk_size}")
-
-
 def run_part2(cfg, args):
+    """Part 2: NeRF 3D场景重建，训练和评估"""
     if not args.data_dir:
         raise ValueError("Part 2 requires --data_dir pointing to a NeRF dataset root.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f">>> 使用设备: {device}")
 
+    # 读取渲染和训练配置
     downscale = cfg.get("downscale", 1)
     white_bkgd = cfg.get("white_bkgd", True)
     scene_scale = cfg.get("scene_scale", 1.0)
-    near = float(cfg.get("near", 2.0))
-    far = float(cfg.get("far", 6.0))
-    n_samples = cfg.get("n_samples", 64)
-    render_n_samples = cfg.get("render_n_samples", n_samples)
-    batch_size = cfg.get("batch_size", 4096)
-    train_iters = cfg.get("train_iters", 20000)
+    near = float(cfg.get("near", 2.0))  # 近平面
+    far = float(cfg.get("far", 6.0))  # 远平面
+    n_samples = cfg.get("n_samples", 64)  # 训练采样点数
+    render_n_samples = cfg.get("render_n_samples", n_samples)  # 渲染采样点数
+    batch_size = cfg.get("batch_size", 4096)  # 每批光线数
+    train_iters = cfg.get("train_iters", 20000)  # 训练迭代数
     learning_rate = cfg.get("learning_rate", 5e-4)
     log_every = cfg.get("log_every", 100)
     save_every = cfg.get("save_every", 2000)
-    chunk = cfg.get("chunk", 8192)
+    chunk = cfg.get("chunk", 8192)  # 渲染块大小
     log_dir = cfg.get("log_dir", "output/part2")
     if args.render_chunk:
         chunk = args.render_chunk
 
+    # 创建输出目录
     os.makedirs(log_dir, exist_ok=True)
     ckpt_dir = os.path.join(log_dir, "checkpoints")
     render_dir = os.path.join(log_dir, "renders")
     os.makedirs(ckpt_dir, exist_ok=True)
     os.makedirs(render_dir, exist_ok=True)
 
+    # 加载训练和测试数据集
     train_set = BlenderDataset(
         root_dir=args.data_dir,
         split="train",
@@ -258,12 +231,14 @@ def run_part2(cfg, args):
         scene_scale=scene_scale,
     )
 
+    # 初始化模型
     model = NeuralField(cfg).to(device)
     if args.checkpoint:
         ckpt = torch.load(args.checkpoint, map_location=device)
         model.load_state_dict(ckpt["model_state_dict"])
         print(f">>> Loaded checkpoint: {args.checkpoint}")
 
+    # 训练阶段
     if not args.eval_only:
         optimizer = optim.Adam(model.parameters(), lr=learning_rate)
         loss_fn = nn.MSELoss()
@@ -271,6 +246,7 @@ def run_part2(cfg, args):
         print(">>> Start Training Part 2 (NeRF)...")
         model.train()
         for step in range(1, train_iters + 1):
+            # 随机采样光线并渲染
             rays_o, rays_d, target = train_set.sample_random_rays(batch_size, device)
             pred_rgb, _, _ = render_rays(
                 model=model,
@@ -306,6 +282,7 @@ def run_part2(cfg, args):
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
+    # 评估阶段：渲染测试集
     model.eval()
     print(f">>> Rendering {test_split} set...")
     psnrs = []
@@ -313,6 +290,7 @@ def run_part2(cfg, args):
         for idx in range(len(test_set)):
             rays_o, rays_d, target = test_set.get_image_rays(idx, device)
             pred = render_image_safe(
+                render_fn=render_image,
                 model=model,
                 rays_o=rays_o,
                 rays_d=rays_d,
@@ -335,7 +313,7 @@ def run_part2(cfg, args):
     print(f">>> Rendered images saved to: {render_dir}")
 
 
-def main():
+if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--image", type=str, help="输入图像路径 (Part 1)")
     parser.add_argument("--data_dir", type=str, help="NeRF 数据集根目录 (Part 2)")
@@ -363,7 +341,3 @@ def main():
         run_part2(cfg, args)
     else:
         raise ValueError(f"Unsupported mode: {mode}")
-
-
-if __name__ == "__main__":
-    main()
