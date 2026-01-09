@@ -12,10 +12,11 @@ class FourierRepresentation(BaseRepresentation):
         self.use_encoding = use_encoding
         
         if use_encoding and L > 0:
-            self.freq_bands = 2. ** torch.linspace(0., L - 1, steps=L)
+            freq_bands = 2. ** torch.linspace(0.0, L - 1, steps=L)
+            self.register_buffer("freq_bands", freq_bands)
             self._out_dim = input_dim + 2 * input_dim * L
         else:
-            self.freq_bands = None
+            self.register_buffer("freq_bands", torch.empty(0))
             self._out_dim = input_dim
 
     def forward(self, x):
