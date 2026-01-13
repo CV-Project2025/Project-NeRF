@@ -35,3 +35,60 @@ class FourierRepresentation(BaseRepresentation):
     def out_dim(self):
         return self._out_dim
 
+
+class HashRepresentation(BaseRepresentation):
+    """
+    多分辨率哈希编码
+    
+    使用 tiny-cuda-nn 的哈希网格实现 O(1) 查询复杂度，将 3D 空间划分为多个分辨率的网格，顶点映射到哈希表中。
+    
+    """
+    def __init__(self, 
+                 n_levels=16,              # 分辨率层级数
+                 n_features_per_level=2,   # 每层特征数
+                 log2_hashmap_size=19,     # 哈希表大小 log2(2^19 = 512K)
+                 base_resolution=16,       # 最粗层的分辨率
+                 per_level_scale=1.5,      # 每层分辨率增长系数
+                 bound=1.0):               # 场景边界 [-bound, bound]
+        super().__init__()
+        self.bound = bound
+        
+
+        import tinycudann as tcnn
+        
+        # 配置 TCNN 哈希编码
+        encoding_config = {
+            "otype": "HashGrid",                    # 哈希网格编码
+            "n_levels": n_levels,
+            "n_features_per_level": n_features_per_level,
+            "log2_hashmap_size": log2_hashmap_size,
+            "base_resolution": base_resolution,
+            "per_level_scale": per_level_scale,
+        }
+        
+        self.encoding = tcnn.Encoding(
+            n_input_dims=3,                         # 输入：3D 坐标 (x, y, z)
+            encoding_config=encoding_config
+        )
+        self._out_dim = self.encoding.n_output_dims  # 输出维度 = n_levels * n_features_per_level
+
+    def forward(self, x):
+        """
+        将 3D 坐标编码为哈希特征
+        
+        Args:
+            x: [N, 3] 世界坐标
+        
+        Returns:
+            features: [N, out_dim] 哈希编码特征
+        """
+        # tiny-cuda-nn 的要求，将世界坐标 [-bound, bound] 映射到 [0, 1]
+        x_normalized = (x + self.bound) / (2 * self.bound)
+        x_clamped = x_normalized.clamp(0.0, 1.0)
+        
+        return self.encoding(x_clamped)
+
+    @property
+    def out_dim(self):
+        return self._out_dim
+
