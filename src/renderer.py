@@ -1,4 +1,131 @@
 import torch
+import torch.nn as nn
+
+
+class DensityGrid(nn.Module):
+    """
+    - 维护一个 3D 位图网格，记录空间中哪些区域有物体（sigma > threshold）
+    - 训练时跳过所有 sigma ≈ 0 的空区域（Empty Space Skipping）
+    - 定期更新网格（每 16 步），适应场景变化
+    - 优势：提高采样效率、收敛速度、渲染质量
+    """
+    def __init__(self, resolution=128, bound=1.0, threshold=0.01):
+        """
+        Args:
+            resolution: 网格分辨率（默认 128³）
+            bound: 场景边界 [-bound, bound]
+            threshold: 密度阈值，sigma < threshold 视为空区域
+        """
+        super().__init__()
+        self.resolution = resolution
+        self.bound = bound
+        self.threshold = threshold
+        
+        # 密度网格：存储每个 voxel 的平均密度
+        self.register_buffer("grid", torch.zeros(resolution, resolution, resolution))
+        
+        # 二值网格：表示 voxel 有没有物体
+        # 参数register_buffer 告诉 PyTorch 这个变量是模型的一部分，但它不是需要梯度更新的“参数”。它会随模型一起保存（.pth），并随模型自动移动到 GPU
+        self.register_buffer("binary_grid", torch.ones(resolution, resolution, resolution, dtype=torch.bool))
+        
+        # 网格坐标 [-bound, bound] → [0, resolution-1]
+        self.scale = resolution / (2 * bound)
+        self.offset = bound
+
+    @torch.no_grad()
+    def update(self, model, n_samples=128**3, device='cuda'):
+        """
+        更新占据网格：通过询问 model 各点的密度值，更新 grid 和 binary_grid
+        
+        Args:
+            model: NeRF 模型
+            n_samples: 采样点数（默认采样所有网格中心）
+            device: 要求 cuda
+        """
+        # 生成网格中心点坐标
+        x = torch.linspace(-self.bound, self.bound, self.resolution, device=device)
+        y = torch.linspace(-self.bound, self.bound, self.resolution, device=device)
+        z = torch.linspace(-self.bound, self.bound, self.resolution, device=device)
+        
+        xx, yy, zz = torch.meshgrid(x, y, z, indexing='ij')
+        pts = torch.stack([xx, yy, zz], dim=-1).reshape(-1, 3)  # [resolution³, 3]
+        
+        # 分批查询密度（避免显存溢出）
+        batch_size = 2**18  # 256K 点一批
+        density_values = []
+        
+        for i in range(0, pts.shape[0], batch_size):
+            batch_pts = pts[i:i + batch_size]
+            
+            # 使用零方向（密度与方向无关）
+            dummy_dirs = torch.zeros_like(batch_pts)
+            
+            # 查询模型密度
+            with torch.no_grad():
+                _, sigma = model(batch_pts, dummy_dirs)
+            
+            density_values.append(sigma.squeeze(-1))
+        
+        # 拼接所有密度值
+        all_densities = torch.cat(density_values, dim=0)  # [resolution³]
+        
+        # 重塑为 3D 网格
+        self.grid = all_densities.reshape(self.resolution, self.resolution, self.resolution)
+        
+        # 更新二值网格：密度 > threshold 的区域标记为活跃
+        self.binary_grid = (self.grid > self.threshold)
+        
+        # 统计活跃 voxel 比例
+        active_ratio = self.binary_grid.float().mean().item()
+        return active_ratio
+
+    def get_active_mask(self, pts):
+        """
+        检查采样点是否在活跃区域内
+        
+        Args:
+            pts: [N, 3] 世界坐标
+        
+        Returns:
+            mask: [N] bool 张量，True 表示该点在活跃区域
+        """
+        # 将世界坐标转换为网格索引 [0, resolution-1]
+        indices = ((pts + self.offset) * self.scale).long()
+        
+        # 边界检查
+        valid_mask = (
+            (indices >= 0).all(dim=-1) & 
+            (indices < self.resolution).all(dim=-1)
+        )
+        
+        # 初始化掩码（默认全部非活跃）
+        mask = torch.zeros(pts.shape[0], dtype=torch.bool, device=pts.device)
+        
+        # 查询二值网格
+        valid_indices = indices[valid_mask]
+        if valid_indices.shape[0] > 0:
+            grid_values = self.binary_grid[
+                valid_indices[:, 0],
+                valid_indices[:, 1],
+                valid_indices[:, 2]
+            ]
+            mask[valid_mask] = grid_values
+        
+        return mask
+
+    def should_update(self, step, update_interval=16):
+        """
+        判断是否应该更新网格（每 N 步更新一次）
+        
+        Args:
+            step: 当前训练步数
+            update_interval: 更新间隔（默认 16 步）
+        
+        Returns:
+            bool: 是否应该更新
+        """
+        return step % update_interval == 0
+
 
 def sample_stratified(near, far, n_samples, n_rays, device, perturb):
     """沿光线在 [near, far] 范围内分层采样 3D 点"""
