@@ -113,17 +113,21 @@ class DensityGrid(nn.Module):
         
         return mask
 
-    def should_update(self, step, update_interval=16):
+    def should_update(self, step, update_interval=16, warmup_iters=0):
         """
-        判断是否应该更新网格（每 N 步更新一次）
+        判断是否应该更新网格（每 N 步更新一次，warmup 期间不更新）
         
         Args:
             step: 当前训练步数
             update_interval: 更新间隔（默认 16 步）
+            warmup_iters: warmup 迭代数（默认 0，即不 warmup）
         
         Returns:
             bool: 是否应该更新
         """
+        # warmup 期间不更新网格
+        if step < warmup_iters:
+            return False
         return step % update_interval == 0
 
 
@@ -184,10 +188,14 @@ def render_rays(
     n_samples,
     perturb,
     white_bkgd,
+    density_grid=None,  # Instant-NeRF 使用 density_grid
 ):
     """
     渲染一批光线
     流程: 采样 3D 点 → NeRF 模型预测 → 体渲染
+    
+    Args:
+        density_grid: DensityGrid 实例（可选），将使用空域跳跃优化，只查询活跃区域。
     """
     device = rays_o.device
     n_rays = rays_o.shape[0]
@@ -203,7 +211,36 @@ def render_rays(
     # 展平并输入模型
     pts_flat = pts.reshape(-1, 3)
     view_dirs_flat = view_dirs.reshape(-1, 3)
-    rgb, sigma = model(pts_flat, view_dirs_flat)
+    
+    # Density Grid 过滤空区域
+    if density_grid is not None:
+        # 获取活跃掩码（只查询有物体的区域）
+        active_mask = density_grid.get_active_mask(pts_flat)
+        
+        # 确保至少查询一个点，避免梯度断流
+        # 如果 active_mask 全为 False，强制查询第一个点以保持梯度连接
+        if not active_mask.any():
+            active_mask = active_mask.clone()
+            active_mask[0] = True
+        
+        # 查询活跃点
+        rgb_compact, sigma_compact = model(
+            pts_flat[active_mask],
+            view_dirs_flat[active_mask]
+        )
+        
+        # 使用模型输出创建零张量，继承梯度属性，并显式指定 FP32
+        rgb = rgb_compact.new_zeros(pts_flat.shape[0], 3, dtype=torch.float32)
+        sigma = sigma_compact.new_zeros(pts_flat.shape[0], 1, dtype=torch.float32)
+        
+        # 填充计算结果（PyTorch 的索引赋值支持梯度传播）
+        rgb[active_mask] = rgb_compact.float()
+        sigma[active_mask] = sigma_compact.float()
+    else:
+        # 标准 NeRF: 查询所有点
+        rgb, sigma = model(pts_flat, view_dirs_flat)
+        rgb = rgb.float()
+        sigma = sigma.float()
     
     # 恢复形状
     rgb = rgb.view(n_rays, n_samples, 3)

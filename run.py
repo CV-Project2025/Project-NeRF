@@ -429,6 +429,10 @@ def run_part2_instant(cfg, args):
 
             optimizer.zero_grad()
             loss.backward()
+            
+            # 梯度裁剪，防止梯度爆炸（尤其在 DensityGrid 更新后）
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             optimizer.step()
 
             # 定期更新 Density Grid（warmup 后才开始）

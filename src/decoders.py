@@ -148,8 +148,9 @@ class InstantNeRFDecoder(BaseDecoder):
         # 1. 预测密度和几何特征
         h = self.sigma_net(x_enc)  # [N, 16]
         
-        # 提取密度（使用 exp 保证为正）
-        sigma = torch.exp(h[..., 0:1])  # [N, 1]
+        # softplus(x) = log(1 + exp(x))，更平滑且梯度更稳定
+        # 添加 - 5.0 偏置，让默认密度更低
+        sigma = F.softplus(h[..., 0:1] - 5.0) 
         
         # 几何特征用于颜色预测（包含密度信息）
         geo_feat = h  # [N, 16]
