@@ -84,7 +84,7 @@ python3 run.py --data_dir data/nerf_synthetic/lego --config configs/part2.yaml
 
 ```bash
 # 使用已有模型进行测试
-python3 run.py --data_dir data/nerf_synthetic/lego --config configs/part2.yaml
+python3 run.py --data_dir data/nerf_synthetic/lego --config configs/part2.yaml \
   --checkpoint output/part2/checkpoints/model_step_020000.pth --eval_only
 ```
 
@@ -111,8 +111,8 @@ python3 run.py --data_dir data/nerf_synthetic/lego --config configs/part2_instan
 
 ```bash
 # --render_n 参数：-1表示生成视频，正数表示随机渲染指定数量的视角
-python3 run.py --data_dir data/nerf_synthetic/lego --config configs/part2_instant.yaml
-  --checkpoint output/part2_instant/checkpoints/model_best.pth --eval_only --render_n -1
+python3 run.py --data_dir data/nerf_synthetic/lego --config configs/part2_instant.yaml \
+  --checkpoint output/part2_instant/lego/best_model.pth --eval_only --render_n -1
 ```
 
 **4. 输出说明**
