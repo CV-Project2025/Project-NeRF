@@ -15,7 +15,7 @@ import yaml
 from src.core import NeuralField
 from src.dataset import BlenderDataset
 from src.renderer import render_image, render_rays
-from src.utils import compute_psnr, compute_psnr_torch, render_image_safe
+from src.utils import compute_psnr, compute_psnr_torch, render_image_safe, TensorBoardLogger
 
 
 def run_part1(cfg, args):
@@ -462,13 +462,18 @@ def run_part2_instant(cfg, args):
 
     # 训练阶段
     if not args.eval_only:
+        # 初始化 TensorBoard
+        tb_dir = os.path.join(log_dir, "tensorboard")
+        tb_logger = TensorBoardLogger(tb_dir)
+        
         optimizer = optim.Adam(model.parameters(), lr=learning_rate)
         loss_fn = nn.MSELoss()
 
-        print(f">>> 开始训练 Instant-NeRF (目标: {train_iters} 步)...")
+        print(f">>> 目标: {train_iters} 步")
         print(f">>> 学习率: {learning_rate} ")
         print(f">>> 批量大小: {batch_size}")
         print(f">>> 采样点数: {n_samples} ")
+        print(f">>>  tensorboard --logdir={tb_dir} 查看 TensorBoard 日志")
         
         # 初始化最佳验证集PSNR跟踪
         best_val_psnr = 0.0
@@ -509,7 +514,7 @@ def run_part2_instant(cfg, args):
                 active_ratio = density_grid.update(model, device=device)
                 model.train()
 
-            # 日志输出
+            # 日志输出和 TensorBoard 记录
             if step % log_every == 0:
                 psnr = compute_psnr(loss.item())
                 skip_info = ""
@@ -518,6 +523,12 @@ def run_part2_instant(cfg, args):
                 print(
                     f">>> Step {step}/{train_iters} | Loss {loss.item():.6f} | PSNR {psnr:.2f} dB{skip_info}"
                 )
+                
+                # 记录到 TensorBoard
+                tb_logger.log_scalar('Train/Loss', loss.item(), step)
+                tb_logger.log_scalar('Train/PSNR', psnr, step)
+                if density_grid is not None:
+                    tb_logger.log_scalar('Train/ActiveRatio', active_ratio, step)
             
             # 定期验证集评估
             val_every = cfg.get("val_every", 500)
@@ -553,6 +564,9 @@ def run_part2_instant(cfg, args):
                 avg_val_psnr = float(np.mean(val_psnrs))
                 print(f"    [Validation] PSNR: {avg_val_psnr:.2f} dB", end="")
                 
+                # 记录验证集 PSNR 到 TensorBoard
+                tb_logger.log_scalar('Validation/PSNR', avg_val_psnr, step)
+                
                 # 只在验证集PSNR提升时保存模型
                 if avg_val_psnr > best_val_psnr:
                     best_val_psnr = avg_val_psnr
@@ -573,6 +587,7 @@ def run_part2_instant(cfg, args):
                 model.train()
 
         print(f"\n>>> 训练完成！最佳验证集 PSNR: {best_val_psnr:.2f} dB")
+        tb_logger.close()
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
