@@ -27,6 +27,11 @@ def run_part1(cfg, args):
     batch_size = cfg.get("batch_size", None)
     image_size = cfg.get("image_size", 400)
     log_dir = cfg.get("log_dir", "output/")
+    
+    # 获取图像名称（不含扩展名）并添加到输出路径
+    image_name = os.path.splitext(os.path.basename(args.image))[0]
+    log_dir = os.path.join(log_dir, "part1", image_name)
+    
     save_every = cfg.get("save_every", 500)
     output_dim = cfg["output_dim"]
     def ensure_list(value):
@@ -105,7 +110,7 @@ def run_part1(cfg, args):
             }
 
             run_name = f"pe{int(bool(use_pe))}_L{l_embed}_H{hidden_dim}_N{num_layers}"
-            run_dir = os.path.join(log_dir, "part1", run_name)
+            run_dir = os.path.join(log_dir, run_name)
             os.makedirs(run_dir, exist_ok=True)
 
             save_intermediate = isinstance(save_every, int) and save_every > 0
@@ -339,6 +344,11 @@ def run_part2_instant(cfg, args):
     save_every = cfg.get("save_every", 500)
     chunk = cfg.get("chunk", 16384)  # 更大的渲染块
     log_dir = cfg.get("log_dir", "output/part2_instant")
+    
+    # 获取数据集名称并添加到输出路径
+    dataset_name = os.path.basename(args.data_dir)
+    log_dir = os.path.join(log_dir, dataset_name)
+    
     if args.render_chunk:
         chunk = args.render_chunk
 
@@ -351,7 +361,7 @@ def run_part2_instant(cfg, args):
 
     # 创建输出目录
     os.makedirs(log_dir, exist_ok=True)
-    ckpt_dir = os.path.join(log_dir, "checkpoints")
+    ckpt_dir = os.path.join(log_dir)
     render_dir = os.path.join(log_dir, "renders")
     os.makedirs(ckpt_dir, exist_ok=True)
     os.makedirs(render_dir, exist_ok=True)
@@ -364,6 +374,8 @@ def run_part2_instant(cfg, args):
         white_bkgd=white_bkgd,
         scene_scale=scene_scale,
     )
+    
+    # 加载测试集
     test_split = "test"
     test_meta = os.path.join(args.data_dir, "transforms_test.json")
     if not os.path.exists(test_meta):
@@ -376,13 +388,53 @@ def run_part2_instant(cfg, args):
         scene_scale=scene_scale,
     )
 
+    
+    # 只在训练模式下划分验证集
+    if not args.eval_only:
+        # 从测试集中随机抽取30%作为验证集
+        import random
+        n_test = len(test_set.images)
+        n_val = int(n_test * 0.3)
+        val_indices = random.sample(range(n_test), n_val)
+        test_indices = [i for i in range(n_test) if i not in val_indices]
+        
+        # 创建验证集
+        val_set = BlenderDataset(
+            root_dir=args.data_dir,
+            split=test_split,
+            downscale=downscale,
+            white_bkgd=white_bkgd,
+            scene_scale=scene_scale,
+        )
+        val_set.images = test_set.images[val_indices]
+        val_set.poses = test_set.poses[val_indices]
+        
+        # 不缩减测试集，保持完整
+        print(f">>> 数据集划分: 训练集 {len(train_set.images)} 张 | 验证集 {len(val_set.images)} 张 | 测试集 {len(test_set.images)} 张")
+    else:
+        # 评估模式：使用全部测试集
+        print(f">>> 评估使用全部测试集 {len(test_set.images)} 张")
+        val_set = None
+
     # 初始化模型
-    print(">>> 初始化 Instant-NGP 模型...")
+    print(">>> 初始化 Instant-NeRF 模型...")
     model = NeuralField(cfg).to(device)
-    if args.checkpoint:
-        ckpt = torch.load(args.checkpoint, map_location=device)
-        model.load_state_dict(ckpt["model_state_dict"])
-        print(f">>> Loaded checkpoint: {args.checkpoint}")
+    
+
+    # 自动检测 scene_bound（如果配置中设置为 "auto"）
+    if cfg.get('scene_bound') == 'auto':
+        # 从训练集和测试集姿态中提取相机位置
+        all_poses = torch.cat([train_set.poses, test_set.poses], dim=0)
+        cam_positions = all_poses[:, :3, 3].cpu().numpy()
+        
+        # 计算相机到原点的最大距离
+        max_distance = np.max(np.linalg.norm(cam_positions, axis=1))
+        
+        # 添加5%余量作为 scene_bound
+        scene_bound_auto = max_distance * 1.05
+        cfg['scene_bound'] = scene_bound_auto
+        print(f">>> 自动检测 scene_bound: {scene_bound_auto:.2f}（基于相机最大距离 {max_distance:.2f}）")
+
 
     # 初始化占据网格
     density_grid = None
@@ -397,6 +449,16 @@ def run_part2_instant(cfg, args):
         print(f">>> Density Grid 已启用: {grid_resolution}³ 分辨率")
     else:
         print(">>> Density Grid 已禁用（性能会降低）")
+    
+    # 加载检查点（包括 density_grid）
+    if args.checkpoint:
+        ckpt = torch.load(args.checkpoint, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        if density_grid is not None and "density_grid" in ckpt:
+            density_grid.load_state_dict(ckpt["density_grid"])
+            print(f">>> Loaded checkpoint with DensityGrid: {args.checkpoint} (Step {ckpt.get("step", "未知")} | Val PSNR {ckpt.get("val_psnr", None):.2f} dB)")
+        else:
+            print(f">>> Loaded checkpoint: {args.checkpoint} (Step {ckpt.get("step", "未知")} | Val PSNR {ckpt.get("val_psnr", None):.2f} dB)")
 
     # 训练阶段
     if not args.eval_only:
@@ -407,6 +469,9 @@ def run_part2_instant(cfg, args):
         print(f">>> 学习率: {learning_rate} ")
         print(f">>> 批量大小: {batch_size}")
         print(f">>> 采样点数: {n_samples} ")
+        
+        # 初始化最佳验证集PSNR跟踪
+        best_val_psnr = 0.0
         
         model.train()
         for step in range(1, train_iters + 1):
@@ -430,8 +495,11 @@ def run_part2_instant(cfg, args):
             optimizer.zero_grad()
             loss.backward()
             
-            # 梯度裁剪，防止梯度爆炸（尤其在 DensityGrid 更新后）
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            # 分别裁剪散列表和 MLP 的梯度
+            if hasattr(model, 'representation'):
+                torch.nn.utils.clip_grad_norm_(model.representation.parameters(), max_norm=1.0)
+            if hasattr(model, 'decoder'):
+                torch.nn.utils.clip_grad_norm_(model.decoder.parameters(), max_norm=1.0)
             
             optimizer.step()
 
@@ -440,8 +508,6 @@ def run_part2_instant(cfg, args):
                 model.eval()
                 active_ratio = density_grid.update(model, device=device)
                 model.train()
-                if step % log_every == 0:
-                    print(f"    [Grid Updated] 活跃 voxel: {active_ratio*100:.1f}%")
 
             # 日志输出
             if step % log_every == 0:
@@ -452,67 +518,237 @@ def run_part2_instant(cfg, args):
                 print(
                     f">>> Step {step}/{train_iters} | Loss {loss.item():.6f} | PSNR {psnr:.2f} dB{skip_info}"
                 )
+            
+            # 定期验证集评估
+            val_every = cfg.get("val_every", 500)
+            if step % val_every == 0:
+                model.eval()
+                val_psnrs = []
+                with torch.no_grad():
+                    for idx in range(len(val_set.images)):
+                        rays_o, rays_d, target = val_set.get_image_rays(idx, device)
+                        rays_o = rays_o.reshape(-1, 3)
+                        rays_d = rays_d.reshape(-1, 3)
+                        target = target.reshape(-1, 3)
+                        
+                        # 分块渲染验证集
+                        pred_chunks = []
+                        for i in range(0, rays_o.shape[0], chunk):
+                            pred_chunk, _, _ = render_rays(
+                                model=model,
+                                rays_o=rays_o[i:i+chunk],
+                                rays_d=rays_d[i:i+chunk],
+                                near=near,
+                                far=far,
+                                n_samples=render_n_samples,
+                                perturb=False,
+                                white_bkgd=white_bkgd,
+                                density_grid=density_grid,
+                            )
+                            pred_chunks.append(pred_chunk)
+                        pred = torch.cat(pred_chunks, dim=0)
+                        val_psnr = compute_psnr_torch(pred, target)
+                        val_psnrs.append(val_psnr)
+                
+                avg_val_psnr = float(np.mean(val_psnrs))
+                print(f"    [Validation] PSNR: {avg_val_psnr:.2f} dB", end="")
+                
+                # 只在验证集PSNR提升时保存模型
+                if avg_val_psnr > best_val_psnr:
+                    best_val_psnr = avg_val_psnr
+                    best_path = os.path.join(ckpt_dir, f"best_model.pth")
+                    save_dict = {
+                        "model_state_dict": model.state_dict(),
+                        "config": cfg,
+                        "step": step,
+                        "val_psnr": best_val_psnr
+                    }
+                    if density_grid is not None:
+                        save_dict["density_grid"] = density_grid.state_dict()
+                    torch.save(save_dict, best_path)
+                    print(f" | 🌟 New Best Model! Saved to {best_path}")
+                else:
+                    print()
+                
+                model.train()
 
-            # 保存检查点
-            if save_every and step % save_every == 0:
-                ckpt_path = os.path.join(ckpt_dir, f"model_step_{step:06d}.pth")
-                save_dict = {
-                    "model_state_dict": model.state_dict(),
-                    "config": cfg,
-                    "step": step
-                }
-                if density_grid is not None:
-                    save_dict["density_grid"] = density_grid.state_dict()
-                torch.save(save_dict, ckpt_path)
-
-        # 保存最终模型
-        final_path = os.path.join(ckpt_dir, "model_final.pth")
-        save_dict = {
-            "model_state_dict": model.state_dict(),
-            "config": cfg
-        }
-        if density_grid is not None:
-            save_dict["density_grid"] = density_grid.state_dict()
-        torch.save(save_dict, final_path)
-        print(f">>> 训练完成！模型已保存: {final_path}")
+        print(f"\n>>> 训练完成！最佳验证集 PSNR: {best_val_psnr:.2f} dB")
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    # 评估阶段：渲染测试集
+    # 评估阶段
+    if args.eval_only:
+        import random
+        import shutil
+        import subprocess
+        
+        # 判断是否顺序渲染并生成视频（-1 表示全部测试集）
+        if args.render_n == -1:
+            n_render = len(test_set.images)
+            render_indices = list(range(n_render))
+            
+            # 创建临时图片目录和视频目录
+            picture_dir = os.path.join(log_dir, "picture")
+            video_dir = os.path.join(log_dir)
+            os.makedirs(picture_dir, exist_ok=True)
+            os.makedirs(video_dir, exist_ok=True)
+            
+            print(f"\n>>> 渲染全部测试集图片（按顺序 {n_render} 张）用于生成视频...")
+            
+            model.eval()
+            psnrs = []
+            with torch.no_grad():
+                for i, idx in enumerate(tqdm(render_indices)):
+                    rays_o, rays_d, target = test_set.get_image_rays(idx, device)
+                    H, W = rays_o.shape[:2]
+                    rays_o = rays_o.reshape(-1, 3)
+                    rays_d = rays_d.reshape(-1, 3)
+                    
+                    # 使用 density_grid 加速渲染
+                    pred_chunks = []
+                    for j in range(0, rays_o.shape[0], chunk):
+                        pred_chunk, _, _ = render_rays(
+                            model=model,
+                            rays_o=rays_o[j:j+chunk],
+                            rays_d=rays_d[j:j+chunk],
+                            near=near,
+                            far=far,
+                            n_samples=render_n_samples,
+                            perturb=False,
+                            white_bkgd=white_bkgd,
+                            density_grid=density_grid,  # 使用占据网格加速
+                        )
+                        pred_chunks.append(pred_chunk)
+                    
+                    pred = torch.cat(pred_chunks, dim=0).reshape(H, W, 3)
+                    pred = torch.clamp(pred, 0.0, 1.0)
+                    psnr = compute_psnr_torch(pred, target)
+                    psnrs.append(psnr)
+                    
+                    # 保存为连续编号的帧
+                    plt.imsave(
+                        os.path.join(picture_dir, f"frame_{i:03d}.png"),
+                        pred.cpu().numpy(),
+                    )
+            
+            avg_psnr = float(np.mean(psnrs))
+            print(f"\n>>> 渲染完成！平均 PSNR: {avg_psnr:.2f} dB")
+            
+            # 使用 ffmpeg 生成视频
+            dataset_name = os.path.basename(args.data_dir)
+            video_path = os.path.join(video_dir, f"{dataset_name}_24fps.mp4")
+            print(f"\n>>> 使用 ffmpeg 生成视频...")
+            try:
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-framerate", "24",
+                    "-i", os.path.join(picture_dir, "frame_%03d.png"),
+                    "-c:v", "libx264",
+                    "-pix_fmt", "yuv420p",
+                    "-crf", "18",
+                    video_path
+                ]
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                if result.returncode == 0:
+                    print(f">>> 视频已保存: {video_path}")
+                    print(f">>> 视频时长: {n_render/24:.1f}秒 ({n_render} 帧 @ 24fps)")
+                    
+                    # 删除临时图片目录
+                    shutil.rmtree(picture_dir)
+                    print(f">>> 已清理临时图片目录")
+                else:
+                    print(f"!!! ffmpeg 执行失败:\n{result.stderr}")
+            except FileNotFoundError:
+                print("!!! 未找到 ffmpeg，请先安装: sudo apt install ffmpeg")
+            except Exception as e:
+                print(f"!!! 视频生成失败: {e}")
+        else:
+            # 随机渲染指定数量的图片
+            n_render = min(args.render_n, len(test_set.images))
+            render_indices = random.sample(range(len(test_set.images)), n_render)
+            
+            print(f"\n>>> 渲染测试集图片（随机 {n_render} 张）...")
+            os.makedirs(render_dir, exist_ok=True)
+            psnrs = []
+            
+            model.eval()
+            with torch.no_grad():
+                for i, idx in enumerate(tqdm(render_indices)):
+                    rays_o, rays_d, target = test_set.get_image_rays(idx, device)
+                    H, W = rays_o.shape[:2]
+                    rays_o = rays_o.reshape(-1, 3)
+                    rays_d = rays_d.reshape(-1, 3)
+                    
+                    # 使用 density_grid 加速渲染
+                    pred_chunks = []
+                    for j in range(0, rays_o.shape[0], chunk):
+                        pred_chunk, _, _ = render_rays(
+                            model=model,
+                            rays_o=rays_o[j:j+chunk],
+                            rays_d=rays_d[j:j+chunk],
+                            near=near,
+                            far=far,
+                            n_samples=render_n_samples,
+                            perturb=False,
+                            white_bkgd=white_bkgd,
+                            density_grid=density_grid,  
+                        )
+                        pred_chunks.append(pred_chunk)
+                    
+                    pred = torch.cat(pred_chunks, dim=0).reshape(H, W, 3)
+                    pred = torch.clamp(pred, 0.0, 1.0)
+                    psnr = compute_psnr_torch(pred, target)
+                    psnrs.append(psnr)
+                    
+                    # 保存渲染图片（带PSNR信息）
+                    plt.imsave(
+                        os.path.join(render_dir, f"render_{idx:03d}_psnr{psnr:.2f}.png"),
+                        pred.cpu().numpy(),
+                    )
+            
+            avg_psnr = float(np.mean(psnrs))
+            print(f"\n>>> 渲染完成！平均 PSNR: {avg_psnr:.2f} dB")
+            print(f">>> 保存路径: {render_dir}")
+        return
+    
+    # 训练后的标准评估：计算测试集PSNR
     model.eval()
-    print(f">>> 渲染 {test_split} 集...")
+    print(f"\n>>> 评估 {test_split} 集...")
     psnrs = []
     with torch.no_grad():
-        for idx in range(len(test_set)):
+        for idx in tqdm(range(len(test_set))):
             rays_o, rays_d, target = test_set.get_image_rays(idx, device)
+            H, W = rays_o.shape[:2]
+            rays_o = rays_o.reshape(-1, 3)
+            rays_d = rays_d.reshape(-1, 3)
             
-            # 渲染时也可以使用占据网格加速（但效果不如训练时明显）
-            pred = render_image_safe(
-                render_fn=lambda model, rays_o, rays_d, near, far, n_samples, chunk, white_bkgd: 
-                    render_image(model, rays_o, rays_d, near, far, n_samples, chunk, white_bkgd),
-                model=model,
-                rays_o=rays_o,
-                rays_d=rays_d,
-                near=near,
-                far=far,
-                n_samples=render_n_samples,
-                chunk=chunk,
-                white_bkgd=white_bkgd,
-            )
+            # 使用 density_grid 加速渲染
+            pred_chunks = []
+            for j in range(0, rays_o.shape[0], chunk):
+                pred_chunk, _, _ = render_rays(
+                    model=model,
+                    rays_o=rays_o[j:j+chunk],
+                    rays_d=rays_d[j:j+chunk],
+                    near=near,
+                    far=far,
+                    n_samples=render_n_samples,
+                    perturb=False,
+                    white_bkgd=white_bkgd,
+                    density_grid=density_grid,
+                )
+                pred_chunks.append(pred_chunk)
+            
+            pred = torch.cat(pred_chunks, dim=0).reshape(H, W, 3)
             pred = torch.clamp(pred, 0.0, 1.0)
             psnr = compute_psnr_torch(pred, target)
             psnrs.append(psnr)
-            plt.imsave(
-                os.path.join(render_dir, f"test_{idx:03d}.png"),
-                pred.cpu().numpy(),
-            )
 
     avg_psnr = float(np.mean(psnrs)) if psnrs else 0.0
     print(f"\n{'='*60}")
     print(f">>> Instant-NeRF 评估结果")
-    print(f">>> 平均 PSNR: {avg_psnr:.2f} dB")
-    print(f">>> 渲染结果: {render_dir}")
+    print(f">>> 测试集平均 PSNR: {avg_psnr:.2f} dB")
+    print(f">>> 最佳验证集 PSNR: {best_val_psnr:.2f} dB" if not args.eval_only else "")
     print(f"{'='*60}")
 
 
@@ -527,6 +763,7 @@ if __name__ == "__main__":
         action="store_true",
         help="仅渲染测试集，不进行训练（需 --checkpoint）",
     )
+    parser.add_argument("--render_n", type=int, default=10, help="评估时渲染的测试集图片数量，如果为 -1 则渲染全部") 
     parser.add_argument("--render_chunk", type=int, help="覆盖渲染 chunk 大小")
     args = parser.parse_args()
 

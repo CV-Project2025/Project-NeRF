@@ -25,7 +25,7 @@ hidden_dim: 64 # 隐藏层维度（可以小一点）
 # ============================================
 use_density_grid: true # 启用占据网格
 grid_resolution: 128 # 网格分辨率 128³
-grid_threshold: 0.1 # 密度阈值（过滤低密度区域）
+grid_threshold: 0.12 # 密度阈值（过滤低密度区域）
 grid_update_interval: 16 # 每 16 步更新一次
 grid_warmup_iters: 256 # 前 256 步冻结网格，让模型先学习
 
@@ -43,7 +43,7 @@ scene_scale: 1.0 # 场景缩放
 # 训练配置
 # ============================================
 train_iters: 2000 # 训练步数
-learning_rate: 0.05 # 学习率（高一点）
+learning_rate: 0.01 # 学习率（别太大，不然会遭遇 NaN 崩溃）
 batch_size: 16384 # 批量大小
 log_every: 50 # 日志间隔
 save_every: 500 # 保存间隔
@@ -57,5 +57,6 @@ downscale: 2 # 图像下采样
 # 输出配置
 # ============================================
 log_dir: output/part2_instant
-chunk: 16384 # 渲染块大小（可以用更大的块）
+chunk: 200000 # 渲染块大小（一次处理整张图）
+val_every: 500 # 验证集评估间隔
 
