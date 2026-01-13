@@ -35,18 +35,3 @@ class FourierRepresentation(BaseRepresentation):
     def out_dim(self):
         return self._out_dim
 
-class OctreeRepresentation(BaseRepresentation):
-    """Part 3: 线性八叉树表达 (Explicit) - 预留接口"""
-    def __init__(self, depth=8, feature_dim=32):
-        super().__init__()
-        self._out_dim = feature_dim
-        # TODO: self.octree = ocnn.Octree(depth)
-
-    def forward(self, x):
-        # TODO: codes = ocnn.xyz2morton(x)
-        # TODO: feats = ocnn.octree_query(self.octree, codes)
-        raise NotImplementedError("To be implemented in Part 3 with O-CNN")
-
-    @property
-    def out_dim(self):
-        return self._out_dim

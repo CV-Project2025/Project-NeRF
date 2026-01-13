@@ -43,15 +43,6 @@ class NeuralField(nn.Module):
                 skip_layer=config.get("skip_layer", 4),
                 view_dim=config.get("view_dim", 128),
             )
-        # Part 3: Octree 加速
-        elif self.mode == 'part3_octree':
-            self.representation = OctreeRepresentation()
-            self.decoder = StandardMLP(
-                input_dim=self.representation.out_dim,
-                hidden_dim=config['hidden_dim'],
-                output_dim=config['output_dim'],
-                num_layers=config.get('num_layers', 3)
-            )
 
     def forward(self, x, d=None):
         """
