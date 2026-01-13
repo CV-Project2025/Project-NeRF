@@ -1,186 +1,208 @@
-## 资源说明
+# Project-NeRF
 
-#### 1.项目网盘：
+---
 
-[这里](https://disk.pku.edu.cn/link/AAF9F7FDBF0428495A933F2CAFB52E944B) 存放了部分数据集和预训练模型。
+## 1. 资源说明
 
-#### 2.项目报告：
+#### 项目网盘
+
+[这里](https://disk.pku.edu.cn/link/AAF9F7FDBF0428495A933F2CAFB52E944B) 存放了部分数据集和预训练模型，结果。
+
+#### 项目报告
 
 [milestone](https://latex.pku.edu.cn/project/6954fa6e57c9c512c3b063aa)
 
-## 快速开始
+---
 
-#### 1. 克隆代码库
+## 2. 快速开始
+
+### 2.1 环境配置
+
+#### 基本配置
 
 ```bash
+# 1. 克隆代码
 git clone https://github.com/CV-Project2025/Project-NeRF
 cd Project-NeRF
-```
 
-#### 2. 环境配置
-
-```bash
+# 2. 创建并激活环境
 python3 -m venv .venv
 source .venv/bin/activate
+
+# 3. 安装依赖
 pip install -r requirements.txt
 ```
 
-#### 3. 准备数据（Part 1）
+#### Instant-NeRF 依赖安装
 
-将您的图像放入 `data/` 目录，例如 `data/fox.jpg`，可从 [网盘](https://disk.pku.edu.cn/link/AAF9F7FDBF0428495A933F2CAFB52E944B) 获取。
+若要运行 **`Instant-NeRF`** ，请从 [网盘](https://disk.pku.edu.cn/link/AAF9F7FDBF0428495A933F2CAFB52E944B) 下载 `install_ngp.sh` 放置到项目文件夹运行一下，以确保所需的 TinyCUDA-NN 和相关组件正确安装。
 
-#### 4. 直接运行 Part 1：2D 图像拟合
+#### 配置自定义
+
+将 `configs/part{num}.yaml.example` **复制**一份并重命名为 `configs/part{num}.yaml`，并根据需要修改配置文件中的参数。
+
+### 2.2 Part 1: 2D 图像拟合
+
+**1. 数据准备**
+将目标图像（如 `fox.jpg`）放入 `data/` 目录。可以使用网盘提供的测试图。
+
+**2. 训练**
 
 ```bash
+# 执行训练并拟合
 python3 run.py --image data/fox.jpg --config configs/part1.yaml
 ```
 
-- 运行 `python3 run.py -h` 查看参数说明
-
-- 训练完成后，中间结果（调整 [配置](configs/part1.yaml) 里面的`save_every`）会保存到 `output/runs/<run_name>/steps/`，最终结果会保存到 `output/runs/<run_name>/final.png`
-
-- 终端会输出最终的 PSNR 值（**< 30 dB**: 质量较差， **30-40 dB**: 质量良好， **> 40 dB**: 质量优秀）
-
-#### 5. 实验参数调整（Part 1）
-
-**编辑 [configs/part1.yaml](configs/part1.yaml) 进行参数调整**，配置文件包含：
-
-- **位置编码开关**：`use_positional_encoding: true/false`
-- **频率数量**：`L_embed: 5, 10, 15, 20`
-- **隐藏层维度**：`hidden_dim: 128, 256, 512, 1024`
-- **网络深度**：`num_layers: 2, 3, 5, 8`
-- **训练参数**：`epochs`, `learning_rate`
-
-**推荐实验组合**：
-
-1. **验证位置编码**：对比 `use_positional_encoding: false` vs `true`
-2. **频率扫描**：测试 `L_embed = [5, 10, 15, 20]`
-3. **网络容量**：测试 `hidden_dim = [128, 256, 512]`
-4. **深度实验**：修改 `num_layers = [2, 3, 5, 8]` 测试不同层数
-
-#### 6. 准备数据（Part 2）
-
-本项目支持 NeRF Synthetic 数据格式，建议放置在 `data/nerf_synthetic/` 下，例如：
-
-```
-data/nerf_synthetic/lego/
-├── transforms_train.json
-├── transforms_val.json
-├── transforms_test.json
-├── train/
-├── val/
-└── test/
-```
-
-> `transforms_*.json` 内的 `file_path` 通常形如 `./train/r_0`，程序会自动补全扩展名（`.png/.jpg`）。
-
-#### 7. 运行 Part 2：多视角 NeRF
+**3. 测试**
+Part 1 训练过程中会自动进行拟合效果渲染。如果需要手动使用 checkpoint，可以运行：
 
 ```bash
+python3 run.py --image data/fox.jpg --config configs/part1.yaml --checkpoint <path_to_model> --eval_only
+```
+
+**4. 输出说明**
+
+- 训练日志与 TensorBoard 文件保存在 `output/runs/`。
+- 每个 `save_every` 步数会保存当前拟合的图片到 `output/runs/<run_id>/steps/`。
+- 最终结果保存为 `final.png`。
+- PSNR 值越高（如 > 35dB）代表拟合精度越高。
+
+### 2.3 Part 2: 神经辐射场 (NeRF)
+
+**1. 数据准备**
+
+建议下载 NeRF Synthetic 数据集，放置在 `data/nerf_synthetic/`下，可以从 [网盘/part2/data](https://disk.pku.edu.cn/link/AAF9F7FDBF0428495A933F2CAFB52E944B) 获取。
+
+**2. 训练**
+
+```bash
+# 标准 NeRF 训练
 python3 run.py --data_dir data/nerf_synthetic/lego --config configs/part2.yaml
 ```
 
-- 训练输出默认保存在 `output/part2/` 目录
-- 测试集渲染结果位于 `output/part2/renders/`
-- 若数据集中没有 `transforms_test.json`，程序会自动使用 `val` 集合进行评估
-- 若显存不足，可在运行时指定更小的渲染块大小，例如 `--render_chunk 4096`
-
-#### 8. 使用已有模型进行测试（Part 2）
+**3. 测试**
 
 ```bash
-python3 run.py --data_dir data/nerf_synthetic/lego --config configs/part2.yaml \
+# 使用已有模型进行测试
+python3 run.py --data_dir data/nerf_synthetic/lego --config configs/part2.yaml
   --checkpoint output/part2/checkpoints/model_step_020000.pth --eval_only
 ```
 
-#### 9. 质量优先配置（Part 2，可选）
+**4. 输出说明**
+
+- 训练输出默认保存在 output/part2/ 目录
+- 测试集渲染结果位于 output/part2/renders/
+- 若数据集中没有 transforms_test.json，程序会自动使用 val 集合进行评估
+- 若显存不足，可在运行时指定更小的渲染块大小，例如 --render_chunk 4096
+
+### 2.4 Part 2: Instant-NeRF
+
+**1. 数据准备**
+
+数据同标准 NeRF，注意要保证相关 [依赖](#instant-nerf-依赖安装) 已安装。
+
+**2. 训练**
 
 ```bash
-python3 run.py --data_dir data/nerf_synthetic/lego --config configs/part2_quality.yaml
+python3 run.py --data_dir data/nerf_synthetic/lego --config configs/part2_instant.yaml
 ```
 
-- `configs/part2_quality.yaml` 提高训练步数与采样数，通常能获得更高 PSNR（训练更慢）
-- 若需生成视频，可用 `ffmpeg` 将测试集渲染结果拼成视频，例如：
+**3. 测试**
 
 ```bash
-ffmpeg -framerate 30 -i output/part2/renders/test_%03d.png -c:v libx264 -pix_fmt yuv420p output/part2/nerf_video.mp4
+# --render_n 参数：-1表示生成视频，正数表示随机渲染指定数量的视角
+python3 run.py --data_dir data/nerf_synthetic/lego --config configs/part2_instant.yaml
+  --checkpoint output/part2_instant/checkpoints/model_best.pth --eval_only --render_n -1
 ```
 
-## 项目架构
+**4. 输出说明**
+
+- 结果保存在 `output/part2_instant/`。
+- 使用 TensorBoard 监控损失下降与 PSNR 实时变化。
+- 训练和渲染速度较快，可根据需要调整 [配置](configs/part2_instant.yaml) 中 `batch_size` 和 `chunk` 参数以适配显存。
+
+---
+
+## 3. 项目架构
 
 ```
-OctNeRF/
-├── configs/                # YAML 配置文件
-│   ├── part1.yaml
-│   └── part2.yaml
-├── data/
-│   └── fox.jpg
-├── output/
-│   ├── runs/
-│   └── part2/
-├── src/
+Project-NeRF/
+├── configs/                # 实验配置文件
+│   ├── part1.yaml.example          # 2D 拟合配置模板
+│   ├── part2.yaml.example          # 标准 NeRF 配置模板
+│   └── part2_instant.yaml.example  # Instant-NGP 配置模板
+├── data/                   # 数据存放目录
+├── output/                 # 实验输出 (日志, checkpionts, 渲染图)
+├── src/                    # 核心代码
 │   ├── __init__.py
-│   ├── abstract.py         # 定义所有接口 (基类)
-│   ├── dataset.py          # 数据加载 (Blender/NeRF Synthetic)
-│   ├── embeddings.py       # 【组件】坐标映射 (Fourier/Octree)
-│   ├── decoders.py         # 【组件】特征解码 (MLP)
-│   ├── core.py             # 【引擎】组装组件
-│   ├── renderer.py         # 体渲染与采样
-│   └── utils.py            # 工具函数
-├── run.py                  # [入口] 统一启动脚本
-├── requirements.txt        # 依赖列表
-└── README.md               # 项目文档
+│   ├── abstract.py         # 抽象基类定义
+│   ├── core.py             # 神经场核心逻辑 (组装embeddings, decoders)
+│   ├── dataset.py          # 数据加载
+│   ├── decoders.py         # 网络结构
+│   ├── embeddings.py       # 编码器
+│   ├── renderer.py         # 渲染器
+│   └── utils.py            # 通用工具
+├── run.py                  # 统一运行入口
+├── requirements.txt
+└── README.md
 ```
 
-## 核心概念
+---
 
-#### 为什么需要位置编码？
+## 4. 实验原理与架构介绍
 
-**问题**：标准 MLP 存在 **频谱偏差 (Spectral Bias)**
+### Part 1: 2D 图像拟合 (Image Fitting)
 
-- 神经网络天然倾向于学习**低频函数**（平滑变化）
-- 对于高频信息（图像的边缘、纹理等细节）学习困难
-- 直接用坐标 $(x, y)$ 输入 MLP，会得到模糊的结果
+**实验目标**：让神经网络学习并记住一张二维图像的像素分布 $(x, y) \to (r, g, b)$。
 
-**解决方案**：位置编码（Positional Encoding）
+**核心原理**：
 
-- 将低维坐标映射到高维频率空间
-- 让网络能够"看到"不同频率的信息
-- 这是 NeRF 能够合成高质量图像的关键技术
+1.  **频谱偏差 (Spectral Bias)**：标准 MLP 倾向于学习低频信号，导致直接输入坐标无法拟合高频细节（图像模糊）。
+2.  **位置编码 (Positional Encoding)**：通过傅里叶特征映射将低维坐标映射到高维频率空间，使网络能捕获高频细节。
+    $$ \gamma(p) = (\sin(2^0\pi p), \cos(2^0\pi p), ..., \sin(2^{L-1}\pi p), \cos(2^{L-1}\pi p)) $$
 
-#### 位置编码 (Positional Encoding)
+**架构设计**：
 
-对于输入坐标 $p$，使用 Fourier 特征映射：
+- **输入**：像素坐标 $(x, y)$，归一化到 $[-1, 1]$。
+- **编码层**：`FourierRepresentation`，将坐标扩展为 $2+4L$ 维向量。
+- **网络**：`StandardMLP`，全连接层 + ReLU 激活。
+- **输出**：RGB 颜色值。
 
-$$\gamma(p) = (\sin(2^0\pi p), \cos(2^0\pi p), ..., \sin(2^{L-1}\pi p), \cos(2^{L-1}\pi p))$$
+### Part 2: 神经辐射场 (NeRF)
 
-- **输入**：1D 坐标 $p \in \mathbb{R}$
-- **输出维度**：$2L$（L 个频率，每个产生 sin 和 cos）
-- **对于 2D**：$(x, y)$ 编码后维度为 $2 + 4L$（原始坐标 + 编码）
-- **频率范围**：$[2^0\pi, 2^{L-1}\pi]$，覆盖从低频到高频
+**实验目标**：通过稀疏的多视角 2D 图像，重建 3D 场景的几何与外观。
 
-#### 架构设计
+**核心原理**：
 
-```
-输入坐标 (x, y)
-    ↓
-[位置编码层] FourierRepresentation
-    ↓
-特征向量 (dim = 4L)
-    ↓
-[MLP 解码层] StandardMLP
-    ↓
-输出 RGB (3 通道)
-```
+1.  **体渲染 (Volume Rendering)**：物理模型，通过沿着光线积分密度 ($\sigma$) 和颜色 ($c$) 来合成图像颜色。
+    $$ C(r) = \int\_{t_n}^{t_f} T(t) \sigma(r(t)) c(r(t), d) dt $$
+2.  **光线投射 (Ray Marching)**：在每条光线上采样点，输入网络查询密度和颜色，最后累加。
 
-## 实验要求
+**架构设计**：
 
-**Part 1 - 2D 图像拟合**：
+- **输入**：空间坐标 $(x, y, z)$ 和 观察方向 $(\theta, \phi)$。
+- **编码层**：对位置和方向分别进行位置编码。
+- **网络**：`NeRFDecoder` (Standard MLP)。
+  - 输入位置 $\to$ 输出密度 $\sigma$ 和特征向量。
+  - 特征向量 + 观察方向 $\to$ 输出颜色 RGB。
+- **输出**：该点的密度和视点相关的颜色。
 
-- 实现位置编码
-- 实现标准 MLP
-- 计算 PSNR 指标
-- **对比实验**（需要自己进行）：
-  - **有 vs 无位置编码**：验证编码的重要性
-  - **不同频率数 L**：观察频率对细节的影响
-  - **不同网络深度**：3 层 vs 5 层 vs 8 层
-  - **不同隐藏维度**：128 vs 256 vs 512
+### Part 2: Instant-NGP
+
+**实验目标**：加速 NeRF 训练与渲染过程。
+
+**核心原理**：
+
+1.  **多分辨率哈希编码**：
+    - 使用可学习的哈希表存储特征，替代固定的三角函数编码。
+    - 使用哈希冲突（Hash Collision）来换取 $O(1)$ 的查询速度和巨大的参数空间。
+    - 能够在极小的计算开销下捕捉极其精细的几何细节。
+2.  **Density Grid**：
+    - 维护一个粗糙的体素网格，标记空区域。
+    - 光线投射时跳过空区域，大幅减少无效采样，提升效率。
+
+**架构设计**：
+
+- **编码层**：`HashRepresentation` (TinyCUDA-NN 实现)。
+- **网络**：`InstantNeRFDecoder` (Tiny MLP)，通常只有 1-2 层隐含层，计算极快。
+- **流程**：Hash Encodings $\to$ Tiny MLP $\to$ RGB/$\sigma$。
