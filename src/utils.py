@@ -1,6 +1,13 @@
 """工具函数"""
 import torch
 import numpy as np
+import os
+import warnings
+
+# 消除 TensorBoard 警告信息
+warnings.filterwarnings('ignore', category=DeprecationWarning)
+warnings.filterwarnings('ignore', category=FutureWarning)
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
 def compute_psnr(mse):
     """
@@ -69,3 +76,29 @@ def render_image_safe(
             print(f">>> CUDA OOM, reducing render chunk to {chunk_size}")
 
 
+class TensorBoardLogger:
+    """简化的 TensorBoard 日志记录器"""
+    def __init__(self, log_dir):
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+            self.writer = SummaryWriter(log_dir)
+            self.enabled = True
+        except ImportError:
+            print("!!! TensorBoard 未安装，日志功能已禁用")
+            self.writer = None
+            self.enabled = False
+    
+    def log_scalar(self, tag, value, step):
+        """记录标量值"""
+        if self.enabled and self.writer is not None:
+            self.writer.add_scalar(tag, value, step)
+    
+    def log_scalars(self, main_tag, tag_scalar_dict, step):
+        """记录多个标量值"""
+        if self.enabled and self.writer is not None:
+            self.writer.add_scalars(main_tag, tag_scalar_dict, step)
+    
+    def close(self):
+        """关闭 writer"""
+        if self.enabled and self.writer is not None:
+            self.writer.close()

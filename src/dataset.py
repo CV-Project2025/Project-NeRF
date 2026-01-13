@@ -113,7 +113,8 @@ class BlenderDataset:
             rays_o: [H, W, 3] 光线起点 (相机位置)
             rays_d: [H, W, 3] 光线方向 (已归一化)
         """
-        directions = self._directions.reshape(-1, 3)
+        # 将 directions 移动到与 c2w 相同的设备
+        directions = self._directions.to(c2w.device).reshape(-1, 3)
         # 将相机空间方向转换到世界空间
         rays_d = torch.matmul(directions, c2w[:3, :3].T)
         rays_d = rays_d.reshape(self.H, self.W, 3)

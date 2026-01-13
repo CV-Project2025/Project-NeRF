@@ -85,3 +85,78 @@ class NeRFDecoder(BaseDecoder):
         rgb = torch.sigmoid(self.rgb_layer(h))  # 限制到 [0, 1]
         
         return rgb, sigma
+
+
+class InstantNeRFDecoder(BaseDecoder):
+    """
+    Instant-NGP 解码器：针对哈希特征优化的极简 MLP
+    
+    架构设计：
+    - 密度支路：1 层隐藏层
+    - 颜色支路：2 层隐藏层
+    - 使用 FullyFusedMLP（硬件加速，GPU 核函数融合）
+    
+    """
+    def __init__(self, 
+                 pos_dim,         # 位置编码维度（来自 HashRepresentation）
+                 dir_dim,         # 方向编码维度（通常仍用 Fourier）
+                 hidden_dim=64):  # 隐藏层维度（通常用 64）
+        super().__init__()
+        
+
+        import tinycudann as tcnn
+        
+        # 密度支路：位置特征 → 密度 + 几何特征
+        # 输出：1 维密度 + 15 维几何特征（用于颜色预测）
+        self.sigma_net = tcnn.Network(
+            n_input_dims=pos_dim,
+            n_output_dims=16,  # 1 (sigma) + 15 (geo_features)
+            network_config={
+                "otype": "FullyFusedMLP",       # TCNN硬件加速
+                "activation": "ReLU",
+                "output_activation": "None",
+                "n_neurons": hidden_dim,
+                "n_hidden_layers": 1,           
+            }
+        )
+
+        # 颜色支路：几何特征 + 视角方向 → RGB
+        self.color_net = tcnn.Network(
+            n_input_dims=16 + dir_dim,  # geo_features (16) + view_direction
+            n_output_dims=3,            # RGB
+            network_config={
+                "otype": "FullyFusedMLP",
+                "activation": "ReLU",
+                "output_activation": "Sigmoid",  # 直接输出 [0, 1] 范围
+                "n_neurons": hidden_dim,
+                "n_hidden_layers": 2,           
+            }
+        )
+
+    def forward(self, x_enc, d_enc):
+        """
+        前向传播：从编码特征预测 RGB 和密度
+        
+        Args:
+            x_enc: [N, pos_dim] 位置哈希编码
+            d_enc: [N, dir_dim] 方向编码
+        
+        Returns:
+            rgb: [N, 3] 颜色
+            sigma: [N, 1] 密度
+        """
+        # 1. 预测密度和几何特征
+        h = self.sigma_net(x_enc)  # [N, 16]
+        
+        # softplus(x) = log(1 + exp(x))，更平滑且梯度更稳定
+        # 添加 - 5.0 偏置，让默认密度更低
+        sigma = F.softplus(h[..., 0:1] - 5.0) 
+        
+        # 几何特征用于颜色预测（包含密度信息）
+        geo_feat = h  # [N, 16]
+
+        # 2. 预测颜色（结合几何特征和视角）
+        color_input = torch.cat([geo_feat, d_enc], dim=-1)  # [N, 16 + dir_dim]
+        rgb = self.color_net(color_input)  # [N, 3], 已经是 [0, 1] 范围
+        
+        return rgb, sigma

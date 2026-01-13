@@ -11,5 +11,7 @@ __pycache__/
 output/
 data/
 
+# 个人配置
+configs/*.yaml
 
 
