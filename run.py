@@ -313,6 +313,205 @@ def run_part2(cfg, args):
     print(f">>> Rendered images saved to: {render_dir}")
 
 
+def run_part2_instant(cfg, args):
+    """Part 2 Instant: Instant-NeRF 加速训练"""
+    if not args.data_dir:
+        raise ValueError("Part 2 Instant requires --data_dir pointing to a NeRF dataset root.")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f">>> 使用设备: {device}")
+    
+    if device.type != 'cuda':
+        print("!!! Instant-NeRF 在 CPU 上性能无法发挥，强烈建议使用 CUDA GPU")
+
+    # 读取渲染和训练配置
+    downscale = cfg.get("downscale", 2)
+    white_bkgd = cfg.get("white_bkgd", True)
+    scene_scale = cfg.get("scene_scale", 1.0)
+    near = float(cfg.get("near", 2.0))
+    far = float(cfg.get("far", 6.0))
+    n_samples = cfg.get("n_samples", 32)  # Instant-NeRF 需要更少采样点
+    render_n_samples = cfg.get("render_n_samples", n_samples)
+    batch_size = cfg.get("batch_size", 8192)  # Instant-NeRF 使用更大批量
+    train_iters = cfg.get("train_iters", 5000)  # Instant-NeRF 训练更快
+    learning_rate = cfg.get("learning_rate", 0.01)  # Instant-NeRF 使用高学习率
+    log_every = cfg.get("log_every", 50)
+    save_every = cfg.get("save_every", 500)
+    chunk = cfg.get("chunk", 16384)  # 更大的渲染块
+    log_dir = cfg.get("log_dir", "output/part2_instant")
+    if args.render_chunk:
+        chunk = args.render_chunk
+
+    # Instant-NeRF 特有配置
+    use_density_grid = cfg.get("use_density_grid", True)
+    grid_resolution = cfg.get("grid_resolution", 128)
+    grid_threshold = cfg.get("grid_threshold", 0.01)
+    grid_update_interval = cfg.get("grid_update_interval", 16)
+    grid_warmup_iters = cfg.get("grid_warmup_iters", 256)
+
+    # 创建输出目录
+    os.makedirs(log_dir, exist_ok=True)
+    ckpt_dir = os.path.join(log_dir, "checkpoints")
+    render_dir = os.path.join(log_dir, "renders")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    os.makedirs(render_dir, exist_ok=True)
+
+    # 加载训练和测试数据集
+    train_set = BlenderDataset(
+        root_dir=args.data_dir,
+        split="train",
+        downscale=downscale,
+        white_bkgd=white_bkgd,
+        scene_scale=scene_scale,
+    )
+    test_split = "test"
+    test_meta = os.path.join(args.data_dir, "transforms_test.json")
+    if not os.path.exists(test_meta):
+        test_split = "val"
+    test_set = BlenderDataset(
+        root_dir=args.data_dir,
+        split=test_split,
+        downscale=downscale,
+        white_bkgd=white_bkgd,
+        scene_scale=scene_scale,
+    )
+
+    # 初始化模型
+    print(">>> 初始化 Instant-NGP 模型...")
+    model = NeuralField(cfg).to(device)
+    if args.checkpoint:
+        ckpt = torch.load(args.checkpoint, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        print(f">>> Loaded checkpoint: {args.checkpoint}")
+
+    # 初始化占据网格
+    density_grid = None
+    active_ratio = 1.0  # 初始化活跃比例（warmup 期间默认 100%）
+    if use_density_grid:
+        from src.renderer import DensityGrid
+        density_grid = DensityGrid(
+            resolution=grid_resolution,
+            bound=cfg.get('scene_bound', 1.5),
+            threshold=grid_threshold
+        ).to(device)
+        print(f">>> Density Grid 已启用: {grid_resolution}³ 分辨率")
+    else:
+        print(">>> Density Grid 已禁用（性能会降低）")
+
+    # 训练阶段
+    if not args.eval_only:
+        optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+        loss_fn = nn.MSELoss()
+
+        print(f">>> 开始训练 Instant-NeRF (目标: {train_iters} 步)...")
+        print(f">>> 学习率: {learning_rate} ")
+        print(f">>> 批量大小: {batch_size}")
+        print(f">>> 采样点数: {n_samples} ")
+        
+        model.train()
+        for step in range(1, train_iters + 1):
+            # 随机采样光线并渲染
+            rays_o, rays_d, target = train_set.sample_random_rays(batch_size, device)
+            
+            # 使用占据网格加速渲染
+            pred_rgb, _, _ = render_rays(
+                model=model,
+                rays_o=rays_o,
+                rays_d=rays_d,
+                near=near,
+                far=far,
+                n_samples=n_samples,
+                perturb=True,
+                white_bkgd=white_bkgd,
+                density_grid=density_grid,  
+            )
+            loss = loss_fn(pred_rgb, target)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            # 定期更新 Density Grid（warmup 后才开始）
+            if density_grid is not None and density_grid.should_update(step, grid_update_interval, grid_warmup_iters):
+                model.eval()
+                active_ratio = density_grid.update(model, device=device)
+                model.train()
+                if step % log_every == 0:
+                    print(f"    [Grid Updated] 活跃 voxel: {active_ratio*100:.1f}%")
+
+            # 日志输出
+            if step % log_every == 0:
+                psnr = compute_psnr(loss.item())
+                skip_info = ""
+                if density_grid is not None:
+                    skip_info = f" | Skip: {(1-active_ratio)*100:.1f}%"
+                print(
+                    f">>> Step {step}/{train_iters} | Loss {loss.item():.6f} | PSNR {psnr:.2f} dB{skip_info}"
+                )
+
+            # 保存检查点
+            if save_every and step % save_every == 0:
+                ckpt_path = os.path.join(ckpt_dir, f"model_step_{step:06d}.pth")
+                save_dict = {
+                    "model_state_dict": model.state_dict(),
+                    "config": cfg,
+                    "step": step
+                }
+                if density_grid is not None:
+                    save_dict["density_grid"] = density_grid.state_dict()
+                torch.save(save_dict, ckpt_path)
+
+        # 保存最终模型
+        final_path = os.path.join(ckpt_dir, "model_final.pth")
+        save_dict = {
+            "model_state_dict": model.state_dict(),
+            "config": cfg
+        }
+        if density_grid is not None:
+            save_dict["density_grid"] = density_grid.state_dict()
+        torch.save(save_dict, final_path)
+        print(f">>> 训练完成！模型已保存: {final_path}")
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # 评估阶段：渲染测试集
+    model.eval()
+    print(f">>> 渲染 {test_split} 集...")
+    psnrs = []
+    with torch.no_grad():
+        for idx in range(len(test_set)):
+            rays_o, rays_d, target = test_set.get_image_rays(idx, device)
+            
+            # 渲染时也可以使用占据网格加速（但效果不如训练时明显）
+            pred = render_image_safe(
+                render_fn=lambda model, rays_o, rays_d, near, far, n_samples, chunk, white_bkgd: 
+                    render_image(model, rays_o, rays_d, near, far, n_samples, chunk, white_bkgd),
+                model=model,
+                rays_o=rays_o,
+                rays_d=rays_d,
+                near=near,
+                far=far,
+                n_samples=render_n_samples,
+                chunk=chunk,
+                white_bkgd=white_bkgd,
+            )
+            pred = torch.clamp(pred, 0.0, 1.0)
+            psnr = compute_psnr_torch(pred, target)
+            psnrs.append(psnr)
+            plt.imsave(
+                os.path.join(render_dir, f"test_{idx:03d}.png"),
+                pred.cpu().numpy(),
+            )
+
+    avg_psnr = float(np.mean(psnrs)) if psnrs else 0.0
+    print(f"\n{'='*60}")
+    print(f">>> Instant-NeRF 评估结果")
+    print(f">>> 平均 PSNR: {avg_psnr:.2f} dB")
+    print(f">>> 渲染结果: {render_dir}")
+    print(f"{'='*60}")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--image", type=str, help="输入图像路径 (Part 1)")
@@ -339,5 +538,9 @@ if __name__ == "__main__":
         if args.eval_only and not args.checkpoint:
             raise ValueError("eval_only requires --checkpoint.")
         run_part2(cfg, args)
+    elif mode == "part2_instant":
+        if args.eval_only and not args.checkpoint:
+            raise ValueError("eval_only requires --checkpoint.")
+        run_part2_instant(cfg, args)
     else:
         raise ValueError(f"Unsupported mode: {mode}")
