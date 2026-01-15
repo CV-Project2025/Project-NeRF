@@ -174,14 +174,17 @@ class DynamicDataset(BlenderDataset):
         
         # 尝试从元数据中提取时间戳
         times = []
-        for frame in self.frames:
+        for i, frame in enumerate(self.frames):
             # 如果元数据中有 'time' 字段，则直接使用
             if 'time' in frame:
                 times.append(frame['time'])
             else:
                 # 否则，根据帧索引归一化生成时间戳 [0, 1]
                 # 这假设帧是按时间顺序排列的
-                times.append(len(times) / len(self.frames))
+                if len(self.frames) > 1:
+                    times.append(i / (len(self.frames) - 1))
+                else:
+                    times.append(0.0)
         
         self.times = torch.tensor(times, dtype=torch.float32)
 

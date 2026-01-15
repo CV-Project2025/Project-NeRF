@@ -198,6 +198,10 @@ def render_rays(
     Args:
         density_grid: DensityGrid 实例（可选），将使用空域跳跃优化，只查询活跃区域。
         times: [N_rays, 1] 时间戳（可选），用于时变场景渲染。(仅 part3)
+    
+    Returns:
+        如果 times 为 None (静态): (rgb_map, depth_map, acc_map)
+        如果 times 不为 None (动态): (rgb_map, depth_map, acc_map, extras)
     """
     device = rays_o.device
     n_rays = rays_o.shape[0]
@@ -269,26 +273,29 @@ def render_rays(
     # 体渲染
     rgb_map, depth_map, acc_map = volume_render(rgb, sigma, z_vals, rays_d, white_bkgd)
 
-    # extras
-    extras = {}
-    if mode == "part3" and delta_x_flat is not None:
-        # 从 volume_render 复用逻辑计算 weights
-        dists = z_vals[:, 1:] - z_vals[:, :-1]
-        dists = torch.cat([dists, torch.full_like(dists[:, :1], 1e10)], dim=-1)
-        dists = dists * torch.norm(rays_d[:, None, :], dim=-1)
-        alpha = 1.0 - torch.exp(-sigma * dists)
-        trans = torch.cumprod(
-            torch.cat([torch.ones((alpha.shape[0], 1), device=alpha.device), 1.0 - alpha + 1e-10], dim=-1),
-            dim=-1,
-        )[:, :-1]
-        weights = alpha * trans  # [N_rays, N_samples]
+    # 动态返回值：根据是否提供 times 参数决定返回格式，保持向后兼容
+    if times is not None:
+        extras = {}
+        if mode == "part3" and delta_x_flat is not None:
+            # 从 volume_render 复用逻辑计算 weights
+            dists = z_vals[:, 1:] - z_vals[:, :-1]
+            dists = torch.cat([dists, torch.full_like(dists[:, :1], 1e10)], dim=-1)
+            dists = dists * torch.norm(rays_d[:, None, :], dim=-1)
+            alpha = 1.0 - torch.exp(-sigma * dists)
+            trans = torch.cumprod(
+                torch.cat([torch.ones((alpha.shape[0], 1), device=alpha.device), 1.0 - alpha + 1e-10], dim=-1),
+                dim=-1,
+            )[:, :-1]
+            weights = alpha * trans  # [N_rays, N_samples]
 
-        # 恢复 delta_x 的形状并计算加权平均
-        delta_x = delta_x_flat.view(n_rays, n_samples, 3)
-        mean_delta_x = torch.sum(weights.unsqueeze(-1) * delta_x, dim=1)  # [N_rays, 3]
-        extras['mean_delta_x'] = mean_delta_x
-
-    return rgb_map, depth_map, acc_map, extras
+            # 恢复 delta_x 的形状并计算加权平均
+            delta_x = delta_x_flat.view(n_rays, n_samples, 3)
+            mean_delta_x = torch.sum(weights.unsqueeze(-1) * delta_x, dim=1)  # [N_rays, 3]
+            extras['mean_delta_x'] = mean_delta_x
+        
+        return rgb_map, depth_map, acc_map, extras
+    else:
+        return rgb_map, depth_map, acc_map
 
 
 def render_image(
