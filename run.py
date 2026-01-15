@@ -794,18 +794,33 @@ def run_part3(cfg, args):
     if args.render_chunk is not None:
         chunk = args.render_chunk
     log_dir = cfg.get("log_dir", "output/part3")
+    
+    # 获取数据集名称并添加到输出路径
+    dataset_name = os.path.basename(args.data_dir)
+    log_dir = os.path.join(log_dir, dataset_name)
 
     os.makedirs(log_dir, exist_ok=True)
-    ckpt_dir = os.path.join(log_dir, "checkpoints")
+    ckpt_dir = os.path.join(log_dir)
     render_dir = os.path.join(log_dir, "renders")
+    val_render_dir = os.path.join(log_dir, "val_renders")
     os.makedirs(ckpt_dir, exist_ok=True)
     os.makedirs(render_dir, exist_ok=True)
+    os.makedirs(val_render_dir, exist_ok=True)
 
     from src.dataset import DynamicDataset
     
     train_set = DynamicDataset(
         root_dir=args.data_dir,
         split="train",
+        downscale=downscale,
+        white_bkgd=white_bkgd,
+        scene_scale=scene_scale,
+    )
+    
+    # 加载验证集
+    val_set = DynamicDataset(
+        root_dir=args.data_dir,
+        split="val",
         downscale=downscale,
         white_bkgd=white_bkgd,
         scene_scale=scene_scale,
@@ -823,6 +838,8 @@ def run_part3(cfg, args):
         white_bkgd=white_bkgd,
         scene_scale=scene_scale,
     )
+    
+    print(f">>> 数据集: 训练集 {len(train_set.images)} 张 | 验证集 {len(val_set.images)} 张 | 测试集 {len(test_set.images)} 张")
 
     # 模型初始化
     from src.core import NeuralField
@@ -855,9 +872,17 @@ def run_part3(cfg, args):
 
     # 训练阶段
     if not args.eval_only:
+        # 初始化 TensorBoard
+        tb_dir = os.path.join(log_dir, "tensorboard")
+        tb_logger = TensorBoardLogger(tb_dir)
+        
         optimizer = optim.Adam(model.parameters(), lr=learning_rate)
         loss_fn = nn.MSELoss()
         print(">>> 开始训练 Part 3 (Dynamic NeRF)...")
+        print(f">>> tensorboard --logdir={tb_dir} 查看 TensorBoard 日志")
+        
+        # 初始化最佳验证集PSNR跟踪
+        best_val_psnr = 0.0
 
         model.train()
         grid_update_interval = cfg.get('grid_update_interval', 16)
@@ -910,19 +935,96 @@ def run_part3(cfg, args):
                     f"Reg Loss {loss_reg.item():.9f} | "
                     f"PSNR {psnr:.2f} dB{skip_info}"
                 )
-
-            if save_every and step % save_every == 0:
-                ckpt_path = os.path.join(ckpt_dir, f"model_step_{step:06d}.pth")
-                save_dict = {"model_state_dict": model.state_dict(), "config": cfg}
+                
+                # 记录到 TensorBoard
+                tb_logger.log_scalar('Train/RGB_Loss', loss_rgb.item(), step)
+                tb_logger.log_scalar('Train/Reg_Loss', loss_reg.item(), step)
+                tb_logger.log_scalar('Train/Total_Loss', total_loss.item(), step)
+                tb_logger.log_scalar('Train/PSNR', psnr, step)
                 if density_grid is not None:
-                    save_dict["density_grid"] = density_grid.state_dict()
-                torch.save(save_dict, ckpt_path)
+                    tb_logger.log_scalar('Train/ActiveRatio', active_ratio, step)
+            
+            # 定期验证集评估
+            val_every = cfg.get("val_every", 500)
+            if step % val_every == 0:
+                model.eval()
+                val_psnrs = []
+                
+                # 随机选择几张验证集图片进行评估和渲染
+                import random
+                n_val_images = min(5, len(val_set.images))
+                val_indices = random.sample(range(len(val_set.images)), n_val_images)
+                
+                step_val_dir = os.path.join(val_render_dir, f"step_{step:06d}")
+                os.makedirs(step_val_dir, exist_ok=True)
+                
+                with torch.no_grad():
+                    # 对所有验证集计算PSNR
+                    for idx in range(len(val_set.images)):
+                        rays_o, rays_d, target, time = val_set.get_image_rays(idx, device)
+                        H, W = rays_o.shape[:2]
+                        rays_o = rays_o.reshape(-1, 3)
+                        rays_d = rays_d.reshape(-1, 3)
+                        target_flat = target.reshape(-1, 3)
+                        time = time.expand(H*W, 1)
+                        
+                        # 分块渲染验证集
+                        pred_chunks = []
+                        for i in range(0, rays_o.shape[0], chunk):
+                            pred_chunk, _, _, _ = render_rays(
+                                model=model,
+                                rays_o=rays_o[i:i+chunk],
+                                rays_d=rays_d[i:i+chunk],
+                                near=near,
+                                far=far,
+                                n_samples=render_n_samples,
+                                perturb=False,
+                                white_bkgd=white_bkgd,
+                                times=time[i:i+chunk],
+                                density_grid=density_grid,
+                            )
+                            pred_chunks.append(pred_chunk)
+                        pred = torch.cat(pred_chunks, dim=0)
+                        val_psnr = compute_psnr_torch(pred, target_flat)
+                        val_psnrs.append(val_psnr)
+                        
+                        # 保存随机选中的几张图片
+                        if idx in val_indices:
+                            pred_img = pred.reshape(H, W, 3)
+                            pred_img = torch.clamp(pred_img, 0.0, 1.0)
+                            plt.imsave(
+                                os.path.join(step_val_dir, f"val_{idx:03d}_t{time[0,0]:.2f}_psnr{val_psnr:.2f}.png"),
+                                pred_img.cpu().numpy(),
+                            )
+                
+                avg_val_psnr = float(np.mean(val_psnrs))
+                print(f"    [Validation] PSNR: {avg_val_psnr:.2f} dB", end="")
+                
+                # 记录验证集 PSNR 到 TensorBoard
+                tb_logger.log_scalar('Validation/PSNR', avg_val_psnr, step)
+                
+                # 只在验证集PSNR提升时保存模型
+                if avg_val_psnr > best_val_psnr:
+                    best_val_psnr = avg_val_psnr
+                    best_path = os.path.join(ckpt_dir, f"best_model.pth")
+                    save_dict = {
+                        "model_state_dict": model.state_dict(),
+                        "config": cfg,
+                        "step": step,
+                        "val_psnr": best_val_psnr
+                    }
+                    if density_grid is not None:
+                        save_dict["density_grid"] = density_grid.state_dict()
+                    torch.save(save_dict, best_path)
+                    print(f" | 🌟 New Best Model! Saved to {best_path}")
+                else:
+                    print()
+                
+                model.train()
 
-        final_path = os.path.join(ckpt_dir, "model_final.pth")
-        save_dict = {"model_state_dict": model.state_dict(), "config": cfg}
-        if density_grid is not None:
-            save_dict["density_grid"] = density_grid.state_dict()
-        torch.save(save_dict, final_path)
+        print(f"\n>>> 训练完成！最佳验证集 PSNR: {best_val_psnr:.2f} dB")
+        tb_logger.close()
+        
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
