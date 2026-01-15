@@ -15,7 +15,7 @@ import yaml
 from src.core import NeuralField
 from src.dataset import BlenderDataset
 from src.renderer import render_image, render_rays
-from src.utils import compute_psnr, compute_psnr_torch, render_image_safe, TensorBoardLogger
+from src.utils import compute_psnr, compute_psnr_torch, render_image_safe, TensorBoardLogger, get_exp_name
 
 
 def run_part1(cfg, args):
@@ -33,6 +33,7 @@ def run_part1(cfg, args):
     log_dir = os.path.join(log_dir, "part1", image_name)
     
     save_every = cfg.get("save_every", 500)
+    log_every = cfg.get("log_every", 100)  # 日志记录频率
     output_dim = cfg["output_dim"]
     def ensure_list(value):
         if isinstance(value, (list, tuple)):
@@ -81,6 +82,11 @@ def run_part1(cfg, args):
     )
     print(f">>> 参数组合数: {len(param_combos)}")
 
+    # 初始化 TensorBoard
+    tb_base_dir = os.path.join(log_dir, "tensorboard")
+    os.makedirs(tb_base_dir, exist_ok=True)
+    print(f">>> tensorboard --logdir={tb_base_dir} 查看 TensorBoard 日志")
+    
     with open(results_path, "a", newline="", encoding="utf-8") as f:
         fieldnames = [
             "use_positional_encoding",
@@ -113,6 +119,10 @@ def run_part1(cfg, args):
             run_dir = os.path.join(log_dir, run_name)
             os.makedirs(run_dir, exist_ok=True)
 
+            # 初始化 TensorBoard logger
+            tb_dir = os.path.join(tb_base_dir, run_name)
+            tb_logger = TensorBoardLogger(tb_dir)
+
             save_intermediate = isinstance(save_every, int) and save_every > 0
             if save_intermediate:
                 steps_dir = os.path.join(run_dir, "steps")
@@ -140,6 +150,12 @@ def run_part1(cfg, args):
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
+
+                # 记录到 TensorBoard
+                if (i + 1) % log_every == 0:
+                    psnr = compute_psnr(loss.item())
+                    tb_logger.log_scalar('Train/Loss', loss.item(), i + 1)
+                    tb_logger.log_scalar('Train/PSNR', psnr, i + 1)
 
                 # 定期保存中间结果
                 if save_intermediate and (i + 1) % save_every == 0:
@@ -179,6 +195,10 @@ def run_part1(cfg, args):
                 }
             )
             f.flush()
+            
+            # 记录最终 PSNR 到 TensorBoard
+            tb_logger.log_scalar('Final/PSNR', final_psnr, epochs)
+            tb_logger.close()
 
             print(f">>> Done! Final PSNR: {final_psnr:.2f} dB")
 
@@ -245,6 +265,11 @@ def run_part2(cfg, args):
 
     # 训练阶段
     if not args.eval_only:
+        # 初始化 TensorBoard
+        tb_dir = os.path.join(log_dir, "tensorboard")
+        tb_logger = TensorBoardLogger(tb_dir)
+        print(f">>> tensorboard --logdir={tb_dir} 查看 TensorBoard 日志")
+        
         optimizer = optim.Adam(model.parameters(), lr=learning_rate)
         loss_fn = nn.MSELoss()
 
@@ -274,6 +299,10 @@ def run_part2(cfg, args):
                 print(
                     f">>> Step {step}/{train_iters} | Loss {loss.item():.6f} | PSNR {psnr:.2f} dB"
                 )
+                
+                # 记录到 TensorBoard
+                tb_logger.log_scalar('Train/Loss', loss.item(), step)
+                tb_logger.log_scalar('Train/PSNR', psnr, step)
 
             if save_every and step % save_every == 0:
                 ckpt_path = os.path.join(ckpt_dir, f"model_step_{step:06d}.pth")
@@ -283,6 +312,9 @@ def run_part2(cfg, args):
 
         final_path = os.path.join(ckpt_dir, "model_final.pth")
         torch.save({"model_state_dict": model.state_dict(), "config": cfg}, final_path)
+        
+        tb_logger.close()
+        print(f">>> 训练完成！TensorBoard 日志已保存到: {tb_dir}")
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -463,7 +495,7 @@ def run_part2_instant(cfg, args):
     # 训练阶段
     if not args.eval_only:
         # 初始化 TensorBoard
-        tb_dir = os.path.join(log_dir, "tensorboard")
+        tb_dir = os.path.join(log_dir, "tensorboard", get_exp_name(cfg))
         tb_logger = TensorBoardLogger(tb_dir)
         
         optimizer = optim.Adam(model.parameters(), lr=learning_rate)
@@ -473,7 +505,7 @@ def run_part2_instant(cfg, args):
         print(f">>> 学习率: {learning_rate} ")
         print(f">>> 批量大小: {batch_size}")
         print(f">>> 采样点数: {n_samples} ")
-        print(f">>>  tensorboard --logdir={tb_dir} 查看 TensorBoard 日志")
+        print(f">>> tensorboard --logdir={os.path.join(log_dir, 'tensorboard')} 查看 TensorBoard 日志")
         
         # 初始化最佳验证集PSNR跟踪
         best_val_psnr = 0.0
@@ -873,13 +905,13 @@ def run_part3(cfg, args):
     # 训练阶段
     if not args.eval_only:
         # 初始化 TensorBoard
-        tb_dir = os.path.join(log_dir, "tensorboard")
+        tb_dir = os.path.join(log_dir, "tensorboard", get_exp_name(cfg))
         tb_logger = TensorBoardLogger(tb_dir)
         
         optimizer = optim.Adam(model.parameters(), lr=learning_rate)
         loss_fn = nn.MSELoss()
         print(">>> 开始训练 Part 3 (Dynamic NeRF)...")
-        print(f">>> tensorboard --logdir={tb_dir} 查看 TensorBoard 日志")
+        print(f">>> tensorboard --logdir={os.path.join(log_dir, 'tensorboard')} 查看 TensorBoard 日志")
         
         # 初始化最佳验证集PSNR跟踪
         best_val_psnr = 0.0

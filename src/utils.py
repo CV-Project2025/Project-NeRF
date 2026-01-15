@@ -76,6 +76,13 @@ def render_image_safe(
             print(f">>> CUDA OOM, reducing render chunk to {chunk_size}")
 
 
+def get_exp_name(cfg):
+    """获取实验名称（从配置或自动生成时间戳）"""
+    from datetime import datetime
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return cfg.get("exp_name", timestamp)
+
+
 class TensorBoardLogger:
     """简化的 TensorBoard 日志记录器"""
     def __init__(self, log_dir):
