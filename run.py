@@ -511,7 +511,7 @@ def run_part2_instant(cfg, args):
             # 定期更新 Density Grid（warmup 后才开始）
             if density_grid is not None and density_grid.should_update(step, grid_update_interval, grid_warmup_iters):
                 model.eval()
-                active_ratio = density_grid.update(model, device=device)
+                active_ratio = density_grid.update(model, device=device, time=None)
                 model.train()
 
             # 日志输出和 TensorBoard 记录
@@ -828,9 +828,29 @@ def run_part3(cfg, args):
     from src.core import NeuralField
     model = NeuralField(cfg).to(device)
     
+    # 如果使用 instant 模式，启用 density_grid
+    canonical_type = cfg.get('canonical_type', 'nerf')
+    density_grid = None
+    active_ratio = 1.0
+    if canonical_type == 'instant':
+        use_density_grid = cfg.get('use_density_grid', True)
+        if use_density_grid:
+            from src.renderer import DensityGrid
+            grid_resolution = cfg.get('grid_resolution', 128)
+            grid_threshold = cfg.get('grid_threshold', 0.01)
+            scene_bound = cfg.get('scene_bound', 1.5)
+            density_grid = DensityGrid(
+                resolution=grid_resolution,
+                bound=scene_bound,
+                threshold=grid_threshold
+            ).to(device)
+            print(f">>> Density Grid 已启用: {grid_resolution}³ 分辨率 (Instant-NGP 模式)")
+    
     if args.checkpoint:
         ckpt = torch.load(args.checkpoint, map_location=device)
         model.load_state_dict(ckpt["model_state_dict"])
+        if density_grid is not None and "density_grid" in ckpt:
+            density_grid.load_state_dict(ckpt["density_grid"])
         print(f">>> Loaded checkpoint: {args.checkpoint}")
 
     # 训练阶段
@@ -840,6 +860,9 @@ def run_part3(cfg, args):
         print(">>> 开始训练 Part 3 (Dynamic NeRF)...")
 
         model.train()
+        grid_update_interval = cfg.get('grid_update_interval', 16)
+        grid_warmup_iters = cfg.get('grid_warmup_iters', 256)
+        
         for step in range(1, train_iters + 1):
             rays_o, rays_d, target, times = train_set.sample_random_rays(batch_size, device)
             
@@ -853,7 +876,8 @@ def run_part3(cfg, args):
                 n_samples=n_samples,
                 perturb=True,
                 white_bkgd=white_bkgd,
-                times=times, # 传入时间
+                times=times,
+                density_grid=density_grid,
             )
             
             # A. 辅助损失函数: RGB Loss + Deformation Regularization
@@ -865,25 +889,40 @@ def run_part3(cfg, args):
             optimizer.zero_grad()
             total_loss.backward()
             optimizer.step()
+            
+            if density_grid is not None and density_grid.should_update(step, grid_update_interval, grid_warmup_iters):
+                model.eval()
+                # 随机采样一个时刻进行增量更新,多次迭代后会自动形成运动轨迹的时空并集
+                time_min = train_set.times.min().item()
+                time_max = train_set.times.max().item()
+                rand_time = torch.rand(1, 1, device=device) * (time_max - time_min) + time_min
+                active_ratio = density_grid.update(model, device=device, time=rand_time, decay=0.95)
+                model.train()
 
             if step % log_every == 0:
                 psnr = compute_psnr(loss_rgb.item())
+                skip_info = ""
+                if density_grid is not None:
+                    skip_info = f" | Skip: {(1-active_ratio)*100:.1f}%"
                 print(
                     f">>> Step {step}/{train_iters} | "
                     f"RGB Loss {loss_rgb.item():.6f} | "
-                    f"Reg Loss {loss_reg.item():.6f} | "
-                    f"PSNR {psnr:.2f} dB"
+                    f"Reg Loss {loss_reg.item():.9f} | "
+                    f"PSNR {psnr:.2f} dB{skip_info}"
                 )
 
             if save_every and step % save_every == 0:
                 ckpt_path = os.path.join(ckpt_dir, f"model_step_{step:06d}.pth")
-                torch.save(
-                    {"model_state_dict": model.state_dict(), "config": cfg},
-                    ckpt_path
-                )
+                save_dict = {"model_state_dict": model.state_dict(), "config": cfg}
+                if density_grid is not None:
+                    save_dict["density_grid"] = density_grid.state_dict()
+                torch.save(save_dict, ckpt_path)
 
         final_path = os.path.join(ckpt_dir, "model_final.pth")
-        torch.save({"model_state_dict": model.state_dict(), "config": cfg}, final_path)
+        save_dict = {"model_state_dict": model.state_dict(), "config": cfg}
+        if density_grid is not None:
+            save_dict["density_grid"] = density_grid.state_dict()
+        torch.save(save_dict, final_path)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -913,6 +952,7 @@ def run_part3(cfg, args):
                     perturb=False,
                     white_bkgd=white_bkgd,
                     times=time[i:i+chunk],
+                    density_grid=density_grid,
                 )
                 pred_chunks.append(pred_chunk)
             

@@ -33,14 +33,17 @@ class DensityGrid(nn.Module):
         self.offset = bound
 
     @torch.no_grad()
-    def update(self, model, n_samples=128**3, device='cuda'):
+    def update(self, model, n_samples=128**3, device='cuda', time=None, decay=0.95):
         """
         更新占据网格：通过询问 model 各点的密度值，更新 grid 和 binary_grid
+        part 3 时空并集更新：保留历史轨迹，取最大值
         
         Args:
             model: NeRF 模型
             n_samples: 采样点数（默认采样所有网格中心）
             device: 要求 cuda
+            time: 时间参数 [1, 1]（仅 Part 3 动态模型需要，随机采样时刻）
+            decay: 衰减系数（0.95），让旧的密度慢慢消失
         """
         # 生成网格中心点坐标
         x = torch.linspace(-self.bound, self.bound, self.resolution, device=device)
@@ -54,6 +57,9 @@ class DensityGrid(nn.Module):
         batch_size = 2**18  # 256K 点一批
         density_values = []
         
+        # 检测模型是否为 Part 3 动态模型
+        mode = getattr(model, 'mode', 'unknown')
+        
         for i in range(0, pts.shape[0], batch_size):
             batch_pts = pts[i:i + batch_size]
             
@@ -62,15 +68,31 @@ class DensityGrid(nn.Module):
             
             # 查询模型密度
             with torch.no_grad():
-                _, sigma = model(batch_pts, dummy_dirs)
+                if mode == 'part3':
+                    # 动态模型：使用数据集中间时刻的真实时间戳构建网格
+                    if time is None:
+                        raise ValueError("Part 3 density grid update requires a time parameter from dataset")
+                    time_batch = time.expand(batch_pts.shape[0], -1)
+                    _, sigma, _ = model(batch_pts, dummy_dirs, t=time_batch)
+                else:
+                    # 静态模型
+                    _, sigma = model(batch_pts, dummy_dirs)
             
             density_values.append(sigma.squeeze(-1))
         
         # 拼接所有密度值
         all_densities = torch.cat(density_values, dim=0)  # [resolution³]
         
-        # 重塑为 3D 网格
-        self.grid = all_densities.reshape(self.resolution, self.resolution, self.resolution)
+        # 重塑为 3D 网格（当前时刻）
+        current_grid = all_densities.reshape(self.resolution, self.resolution, self.resolution)
+        
+        # 时空并集：取历史网格（衰减后）和当前网格的最大值，让网格覆盖物体在整个时间段内运动的所有"路径"
+        mode = getattr(model, 'mode', 'unknown')
+        if mode == 'part3':
+            # 保留历史 + 当前时刻取最大值
+            self.grid = torch.maximum(self.grid * decay, current_grid)
+        else:
+            self.grid = current_grid
         
         # 更新二值网格：密度 > threshold 的区域标记为活跃
         self.binary_grid = (self.grid > self.threshold)
@@ -243,10 +265,18 @@ def render_rays(
             active_mask[0] = True
         
         # 查询活跃点
-        rgb_compact, sigma_compact = model(
-            pts_flat[active_mask],
-            view_dirs_flat[active_mask]
-        )
+        if mode == "part3":
+            rgb_compact, sigma_compact, delta_x_compact = model(
+                pts_flat[active_mask],
+                view_dirs_flat[active_mask],
+                t=times_flat[active_mask] if times_flat is not None else None
+            )
+        else:
+            rgb_compact, sigma_compact = model(
+                pts_flat[active_mask],
+                view_dirs_flat[active_mask]
+            )
+            delta_x_compact = None
         
         # 使用模型输出创建零张量，继承梯度属性，并显式指定 FP32
         rgb = rgb_compact.new_zeros(pts_flat.shape[0], 3, dtype=torch.float32)
@@ -255,7 +285,17 @@ def render_rays(
         # 填充计算结果（PyTorch 的索引赋值支持梯度传播）
         rgb[active_mask] = rgb_compact.float()
         sigma[active_mask] = sigma_compact.float()
-        delta_x_flat = None  # 静态模式无变形
+        
+        # 处理变形量
+        if mode == "part3" and delta_x_compact is not None:
+            delta_x_flat = delta_x_compact.new_zeros(pts_flat.shape[0], 3, dtype=torch.float32)
+            delta_x_flat[active_mask] = delta_x_compact.float()
+        else:
+            delta_x_flat = None
+        
+        rgb = rgb.float().view(n_rays, n_samples, 3)
+        sigma = sigma.float().view(n_rays, n_samples)
+
     else:
         # 标准路径 (适用于所有模式)
         if mode == "part3":
