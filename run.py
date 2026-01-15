@@ -767,6 +767,170 @@ def run_part2_instant(cfg, args):
     print(f"{'='*60}")
 
 
+def run_part3(cfg, args):
+    """Part 3: 动态 NeRF"""
+    if not args.data_dir:
+        raise ValueError("Part 3 requires --data_dir pointing to a dynamic NeRF dataset root.")
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f">>> 使用设备: {device}")
+
+    # 读取渲染和训练配置
+    downscale = cfg.get("downscale", 1)
+    white_bkgd = cfg.get("white_bkgd", True)
+    scene_scale = cfg.get("scene_scale", 1.0)
+    near = float(cfg.get("near", 2.0))
+    far = float(cfg.get("far", 6.0))
+    n_samples = cfg.get("n_samples", 64)
+    render_n_samples = cfg.get("render_n_samples", n_samples)
+    batch_size = cfg.get("batch_size", 4096)
+    train_iters = cfg.get("train_iters", 20000)
+    learning_rate = cfg.get("learning_rate", 5e-4)
+    log_every = cfg.get("log_every", 100)
+    save_every = cfg.get("save_every", 2000)
+    chunk = cfg.get("chunk", 8192)
+    deformation_reg_weight = cfg.get("deformation_reg_weight", 1e-4) # 变形正则化权重
+    render_n = args.render_n
+    if args.render_chunk is not None:
+        chunk = args.render_chunk
+    log_dir = cfg.get("log_dir", "output/part3")
+
+    os.makedirs(log_dir, exist_ok=True)
+    ckpt_dir = os.path.join(log_dir, "checkpoints")
+    render_dir = os.path.join(log_dir, "renders")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    os.makedirs(render_dir, exist_ok=True)
+
+    from src.dataset import DynamicDataset
+    
+    train_set = DynamicDataset(
+        root_dir=args.data_dir,
+        split="train",
+        downscale=downscale,
+        white_bkgd=white_bkgd,
+        scene_scale=scene_scale,
+    )
+    
+    # 加载测试集
+    test_split = "test"
+    test_meta = os.path.join(args.data_dir, "transforms_test.json")
+    if not os.path.exists(test_meta):
+        test_split = "val"
+    test_set = DynamicDataset(
+        root_dir=args.data_dir,
+        split=test_split,
+        downscale=downscale,
+        white_bkgd=white_bkgd,
+        scene_scale=scene_scale,
+    )
+
+    # 模型初始化
+    from src.core import NeuralField
+    model = NeuralField(cfg).to(device)
+    
+    if args.checkpoint:
+        ckpt = torch.load(args.checkpoint, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        print(f">>> Loaded checkpoint: {args.checkpoint}")
+
+    # 训练阶段
+    if not args.eval_only:
+        optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+        loss_fn = nn.MSELoss()
+        print(">>> 开始训练 Part 3 (Dynamic NeRF)...")
+
+        model.train()
+        for step in range(1, train_iters + 1):
+            rays_o, rays_d, target, times = train_set.sample_random_rays(batch_size, device)
+            
+            # 调用修改后的 render_rays，接收 extras
+            pred_rgb, _, _, extras = render_rays(
+                model=model,
+                rays_o=rays_o,
+                rays_d=rays_d,
+                near=near,
+                far=far,
+                n_samples=n_samples,
+                perturb=True,
+                white_bkgd=white_bkgd,
+                times=times, # 传入时间
+            )
+            
+            # A. 辅助损失函数: RGB Loss + Deformation Regularization
+            loss_rgb = loss_fn(pred_rgb, target)
+            mean_delta_x = extras['mean_delta_x'] # 从 extras 获取加权平均变形量
+            loss_reg = torch.mean(mean_delta_x ** 2) * deformation_reg_weight
+            total_loss = loss_rgb + loss_reg
+
+            optimizer.zero_grad()
+            total_loss.backward()
+            optimizer.step()
+
+            if step % log_every == 0:
+                psnr = compute_psnr(loss_rgb.item())
+                print(
+                    f">>> Step {step}/{train_iters} | "
+                    f"RGB Loss {loss_rgb.item():.6f} | "
+                    f"Reg Loss {loss_reg.item():.6f} | "
+                    f"PSNR {psnr:.2f} dB"
+                )
+
+            if save_every and step % save_every == 0:
+                ckpt_path = os.path.join(ckpt_dir, f"model_step_{step:06d}.pth")
+                torch.save(
+                    {"model_state_dict": model.state_dict(), "config": cfg},
+                    ckpt_path
+                )
+
+        final_path = os.path.join(ckpt_dir, "model_final.pth")
+        torch.save({"model_state_dict": model.state_dict(), "config": cfg}, final_path)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # 评估阶段
+    model.eval()
+    print(f">>> Rendering {test_split} set...")
+    psnrs = []
+    
+    with torch.no_grad():
+        num_renders = len(test_set) if render_n == -1 else min(render_n, len(test_set))
+        for idx in range(num_renders):
+            rays_o, rays_d, target, time = test_set.get_image_rays(idx, device)
+            H, W = rays_o.shape[:2]
+            rays_o = rays_o.reshape(-1, 3)
+            rays_d = rays_d.reshape(-1, 3)
+            time = time.expand(H*W, 1)
+
+            pred_chunks = []
+            for i in range(0, rays_o.shape[0], chunk):
+                pred_chunk, _, _, _ = render_rays(
+                    model=model,
+                    rays_o=rays_o[i:i+chunk],
+                    rays_d=rays_d[i:i+chunk],
+                    near=near,
+                    far=far,
+                    n_samples=render_n_samples,
+                    perturb=False,
+                    white_bkgd=white_bkgd,
+                    times=time[i:i+chunk],
+                )
+                pred_chunks.append(pred_chunk)
+            
+            pred = torch.cat(pred_chunks, dim=0).reshape(H, W, 3)
+            pred = torch.clamp(pred, 0.0, 1.0)
+            psnr = compute_psnr_torch(pred, target)
+            psnrs.append(psnr)
+            
+            plt.imsave(
+                os.path.join(render_dir, f"{test_split}_{idx:03d}_t{time[0,0]:.2f}.png"),
+                pred.cpu().numpy(),
+            )
+
+    avg_psnr = float(np.mean(psnrs)) if psnrs else 0.0
+    print(f">>> Test PSNR: {avg_psnr:.2f} dB")
+    print(f">>> Rendered images saved to: {render_dir}")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--image", type=str, help="输入图像路径 (Part 1)")
@@ -798,5 +962,9 @@ if __name__ == "__main__":
         if args.eval_only and not args.checkpoint:
             raise ValueError("eval_only requires --checkpoint.")
         run_part2_instant(cfg, args)
+    elif mode == "part3":
+        if args.eval_only and not args.checkpoint:
+            raise ValueError("eval_only requires --checkpoint.")
+        run_part3(cfg, args)
     else:
         raise ValueError(f"Unsupported mode: {mode}")

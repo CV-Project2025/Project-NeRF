@@ -1,0 +1,61 @@
+# D-NeRF Part 3 配置 - Dynamic Neural Radiance Fields
+
+mode: part3
+
+# ============================================
+# 数据和渲染配置
+# ============================================
+downscale: 2                 # 图像下采样因子 (1=原图, 2=half-res)
+white_bkgd: true             # 是否合成白色背景
+scene_scale: 1.0             # 场景缩放（通常 D-NeRF 数据集已归一化）
+near: 2.0                    # 光线近裁剪面
+far: 6.0                     # 光线远裁剪面
+n_samples: 64                # 训练时每条光线的采样点数
+render_n_samples: 128        # 渲染/评估时的采样点数（更高更精细）
+batch_size: 2048             # 训练批大小（根据显存调整）
+chunk: 4096                  # 渲染时的 chunk 大小（防 OOM）
+
+# ============================================
+# 训练配置
+# ============================================
+train_iters: 50000             # 总训练步数
+learning_rate: 0.0005          # Adam 学习率
+log_every: 100                 # 日志打印频率
+save_every: 5000               # 模型保存频率
+deformation_reg_weight: 0.0001 # 变形 L2 正则化权重 λ (关键超参)
+
+# ============================================
+# 网络架构
+# ============================================
+
+# --- Time & Deformation Network ---
+L_embed_time: 10             # 时间 t 的 Fourier 编码层数
+L_embed: 10                  # 用于变形网络的位置 x 的 Fourier 编码层数
+deform_hidden_dim: 128       # 变形 MLP 隐藏层维度
+deform_num_layers: 4         # 变形 MLP 层数
+
+# --- Canonical Space Representation ---
+# 选择规范空间的表示方式: 'nerf' (MLP) 或 'instant' (HashGrid)
+canonical_type: nerf         # Options: 'nerf' | 'instant'
+
+# -- If canonical_type == 'nerf' --
+L_embed_canon: 10            # 规范空间坐标 x_canon 的 Fourier 编码层数
+hidden_dim: 256              # NeRF MLP 隐藏层维度
+num_layers: 8                # NeRF MLP 总层数
+skip_layer: 4                # NeRF MLP 的跳跃连接层索引
+view_dim: 128                # 方向嵌入后的维度
+
+# -- If canonical_type == 'instant' --
+# 取消注释以下行以启用 Instant-NGP 作为规范表示
+# n_levels: 16
+# n_features_per_level: 2
+# log2_hashmap_size: 19
+# base_resolution: 16
+# per_level_scale: 1.5
+# scene_bound: 1.0           # HashGrid 的边界（应与 scene_scale 一致）
+# hidden_dim: 64             # Instant-NGP 解码器隐藏层维度
+
+# ============================================
+# 输出配置
+# ============================================
+log_dir: "output/part3"      # 输出根目录（模型、渲染结果等）

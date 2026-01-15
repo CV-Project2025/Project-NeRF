@@ -165,3 +165,55 @@ class BlenderDataset:
         rays_d = rays_d / torch.norm(rays_d, dim=-1, keepdim=True)
 
         return rays_o.to(device), rays_d.to(device), target.to(device)
+
+
+class DynamicDataset(BlenderDataset):
+    """动态场景数据集，继承自 BlenderDataset 并增加时间戳支持"""
+    def __init__(self, root_dir, split="train", downscale=1, white_bkgd=True, scene_scale=1.0):
+        super().__init__(root_dir, split, downscale, white_bkgd, scene_scale)
+        
+        # 尝试从元数据中提取时间戳
+        times = []
+        for frame in self.frames:
+            # 如果元数据中有 'time' 字段，则直接使用
+            if 'time' in frame:
+                times.append(frame['time'])
+            else:
+                # 否则，根据帧索引归一化生成时间戳 [0, 1]
+                # 这假设帧是按时间顺序排列的
+                times.append(len(times) / len(self.frames))
+        
+        self.times = torch.tensor(times, dtype=torch.float32)
+
+    def get_image_rays(self, index, device):
+        """获取指定图像的所有光线、目标颜色和对应的时间戳"""
+        rays_o, rays_d = self.get_rays(self.poses[index])
+        target = self.images[index]
+        time = self.times[index].view(1, 1)  # 形状 [1, 1] 便于后续广播
+        return rays_o.to(device), rays_d.to(device), target.to(device), time.to(device)
+
+    def sample_random_rays(self, batch_size, device):
+        """随机采样光线用于训练，并返回对应的时间戳"""
+        img_idx = torch.randint(0, len(self), (batch_size,))
+        pix_y = torch.randint(0, self.H, (batch_size,))
+        pix_x = torch.randint(0, self.W, (batch_size,))
+
+        # 计算光线方向
+        c2w = self.poses[img_idx]
+        dirs = torch.stack([
+            (pix_x - self.W * 0.5) / self.focal,
+            -(pix_y - self.H * 0.5) / self.focal,
+            -torch.ones_like(pix_x),
+        ], dim=-1)
+        rays_d = torch.bmm(c2w[:, :3, :3], dirs.unsqueeze(-1)).squeeze(-1)
+        rays_o = c2w[:, :3, 3]
+        if self.scene_scale != 1.0:
+            rays_o = rays_o * self.scene_scale
+
+        target = self.images[img_idx, pix_y, pix_x]
+        rays_d = rays_d / torch.norm(rays_d, dim=-1, keepdim=True)
+        
+        # 获取时间戳并调整形状为 [batch_size, 1]
+        times = self.times[img_idx].unsqueeze(-1)
+
+        return rays_o.to(device), rays_d.to(device), target.to(device), times.to(device)

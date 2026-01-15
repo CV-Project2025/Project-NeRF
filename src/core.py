@@ -1,6 +1,6 @@
 import torch.nn as nn
 from .embeddings import FourierRepresentation, HashRepresentation
-from .decoders import StandardMLP, NeRFDecoder, InstantNeRFDecoder
+from .decoders import StandardMLP, NeRFDecoder, InstantNeRFDecoder, DeformationNetwork
 
 class NeuralField(nn.Module):
     """神经场模型：坐标 → 编码 → 解码 → 输出"""
@@ -66,18 +66,89 @@ class NeuralField(nn.Module):
                 dir_dim=self.dir_representation.out_dim,
                 hidden_dim=config.get('hidden_dim', 64)
             )
+        elif self.mode == 'part3':
+            # 方向编码
+            L_dir = config.get('L_embed_dir', 4)
+            self.dir_representation = FourierRepresentation(
+                input_dim=3, L=L_dir, use_encoding=True
+            )
+            # 时间编码
+            L_time = config.get('L_embed_time', 10)
+            self.time_encoder = FourierRepresentation(input_dim=1, L=L_time, use_encoding=True)
+            
+            # 变形网络：使用与规范网络输入相同的 L_embed 来编码用于变形的位置
+            L_pos_for_deform = config.get('L_embed', 10)
+            self.pos_encoder_for_deform = FourierRepresentation(input_dim=3, L=L_pos_for_deform, use_encoding=True)
+            
+            self.deform_net = DeformationNetwork(
+                pos_dim=self.pos_encoder_for_deform.out_dim,
+                time_dim=self.time_encoder.out_dim,
+                hidden_dim=config.get('deform_hidden_dim', 128),
+                num_layers=config.get('deform_num_layers', 4)
+            )
+            
+            # 规范网络
+            canonical_type = config.get('canonical_type', 'nerf') # 'nerf' or 'instant'
+            if canonical_type == 'instant':
+                # 使用 Hash Grid 作为规范空间的表示
+                from .embeddings import HashRepresentation
+                self.canonical_repr = HashRepresentation(
+                    n_levels=config.get('n_levels', 16),
+                    n_features_per_level=config.get('n_features_per_level', 2),
+                    log2_hashmap_size=config.get('log2_hashmap_size', 19),
+                    base_resolution=config.get('base_resolution', 16),
+                    per_level_scale=config.get('per_level_scale', 1.5),
+                    bound=config.get('scene_bound', 1.0)
+                )
+                self.decoder = InstantNeRFDecoder(
+                    pos_dim=self.canonical_repr.out_dim,
+                    dir_dim=self.dir_representation.out_dim,
+                    hidden_dim=config.get('hidden_dim', 64)
+                )
+            else: # canonical_type == 'nerf'
+                # 使用 Fourier MLP 作为规范空间的表示
+                L_canon = config.get('L_embed_canon', 10)
+                self.canonical_repr = FourierRepresentation(input_dim=3, L=L_canon, use_encoding=True)
+                self.decoder = NeRFDecoder(
+                    pos_dim=self.canonical_repr.out_dim,
+                    dir_dim=self.dir_representation.out_dim,
+                    hidden_dim=config.get('hidden_dim', 256),
+                    num_layers=config.get('num_layers', 8),
+                    skip_layer=config.get('skip_layer', 4),
+                    view_dim=config.get('view_dim', 128),
+                )
 
-    def forward(self, x, d=None):
+    def forward(self, x, d=None, t=None):
         """
         x: 位置坐标 [N, 2/3]
         d: 视角方向 [N, 3] (仅 part2_nerf/part2_instant)
+        t: 时间戳 [N, 1] (仅 part3)
         """
-        if self.mode in ["part2_nerf", "part2_instant"]:
+        if self.mode == "part3":
+            if t is None:
+                raise ValueError("Part 3 requires time input 't'.")
+            
+            # 变形阶段
+            feat_t = self.time_encoder(t)                     # embed(t)
+            feat_x = self.pos_encoder_for_deform(x)           # embed(x) for deformation
+            delta_x = self.deform_net(feat_x, feat_t)         # DeformationNet(feat_x, feat_t)
+            x_canonical = x + delta_x                         # x_canonical = x + Δx
+
+            # 规范渲染阶段
+            feat_can = self.canonical_repr(x_canonical)       # embed_canonical(x_canonical)
+            feat_d = self.dir_representation(d)               # embed_dir(d)
+            rgb, sigma = self.decoder(feat_can, feat_d)       # CanonicalNet(feat_can, feat_d)
+
+            # 返回 rgb, sigma, Δx
+            return rgb, sigma, delta_x
+
+        elif self.mode in ["part2_nerf", "part2_instant"]:
             if d is None:
                 raise ValueError(f"{self.mode} requires view directions.")
             h = self.representation(x)  # 位置编码
             d = self.dir_representation(d)  # 方向编码
             return self.decoder(h, d)  # → (RGB, σ)
 
-        h = self.representation(x)
-        return self.decoder(h)  # → RGB
+        else:  # part1_fourier
+            h = self.representation(x)
+            return self.decoder(h)  # → RGB

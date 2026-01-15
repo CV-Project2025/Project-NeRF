@@ -160,3 +160,36 @@ class InstantNeRFDecoder(BaseDecoder):
         rgb = self.color_net(color_input)  # [N, 3], 已经是 [0, 1] 范围
         
         return rgb, sigma
+
+
+class DeformationNetwork(BaseDecoder):
+    """
+    变形网络：预测从当前时空点 (x, t) 到规范空间的位移 Δx。
+    输入: 位置 x (3D) 和 时间 t (1D) 的嵌入特征。
+    输出: 位移 Δx (3D)。
+    """
+    def __init__(self, pos_dim, time_dim, hidden_dim=128, num_layers=4):
+        super().__init__()
+        self.num_layers = num_layers
+        
+        # 第一层
+        layers = [nn.Linear(pos_dim + time_dim, hidden_dim), nn.ReLU()]
+        
+        # 中间层
+        for _ in range(num_layers - 2):
+            layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.ReLU()])
+        
+        # 输出层
+        output_layer = nn.Linear(hidden_dim, 3)
+        # 初始化输出层权重为极小值，确保初始位移接近0
+        nn.init.uniform_(output_layer.weight, -1e-4, 1e-4)
+        nn.init.zeros_(output_layer.bias)
+        layers.append(output_layer)
+        
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x_feat, t_feat):
+        # 拼接位置和时间特征
+        h = torch.cat([x_feat, t_feat], dim=-1)
+        delta_x = self.net(h)
+        return delta_x

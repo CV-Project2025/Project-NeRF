@@ -189,6 +189,7 @@ def render_rays(
     perturb,
     white_bkgd,
     density_grid=None,  # Instant-NeRF 使用 density_grid
+    times=None,
 ):
     """
     渲染一批光线
@@ -196,9 +197,22 @@ def render_rays(
     
     Args:
         density_grid: DensityGrid 实例（可选），将使用空域跳跃优化，只查询活跃区域。
+        times: [N_rays, 1] 时间戳（可选），用于时变场景渲染。(仅 part3)
     """
     device = rays_o.device
     n_rays = rays_o.shape[0]
+    mode = getattr(model, 'mode', 'unknown')
+
+    # 兼容性检查与时间处理
+    if mode == "part3":
+        if times is None:
+            # 如果是动态模式但未提供时间，默认使用 t=0
+            times = torch.zeros((n_rays, 1), device=device)
+        # 广播时间戳到每个采样点 [N_rays, N_samples, 1]
+        times_broadcast = times.expand(-1, n_samples).unsqueeze(-1)
+    else:
+        # 静态模式，忽略 times
+        times_broadcast = None
 
     # 沿光线采样点
     z_vals = sample_stratified(near, far, n_samples, n_rays, device, perturb)
@@ -211,7 +225,8 @@ def render_rays(
     # 展平并输入模型
     pts_flat = pts.reshape(-1, 3)
     view_dirs_flat = view_dirs.reshape(-1, 3)
-    
+    times_flat = times_broadcast.reshape(-1, 1) if times_broadcast is not None else None
+
     # Density Grid 过滤空区域
     if density_grid is not None:
         # 获取活跃掩码（只查询有物体的区域）
@@ -236,17 +251,44 @@ def render_rays(
         # 填充计算结果（PyTorch 的索引赋值支持梯度传播）
         rgb[active_mask] = rgb_compact.float()
         sigma[active_mask] = sigma_compact.float()
+        delta_x_flat = None  # 静态模式无变形
     else:
+        # 标准路径 (适用于所有模式)
+        if mode == "part3":
+            # 动态模式: 调用带时间参数的模型
+            rgb_flat, sigma_flat, delta_x_flat = model(pts_flat, view_dirs_flat, t=times_flat)
         # 标准 NeRF: 查询所有点
-        rgb, sigma = model(pts_flat, view_dirs_flat)
-        rgb = rgb.float()
-        sigma = sigma.float()
+        else:
+            rgb_flat, sigma_flat = model(pts_flat, view_dirs_flat)
+            delta_x_flat = None
     
-    # 恢复形状
-    rgb = rgb.view(n_rays, n_samples, 3)
-    sigma = sigma.view(n_rays, n_samples)
+        # 恢复形状
+        rgb = rgb_flat.float().view(n_rays, n_samples, 3)
+        sigma = sigma_flat.float().view(n_rays, n_samples)
 
-    return volume_render(rgb, sigma, z_vals, rays_d, white_bkgd)
+    # 体渲染
+    rgb_map, depth_map, acc_map = volume_render(rgb, sigma, z_vals, rays_d, white_bkgd)
+
+    # extras
+    extras = {}
+    if mode == "part3" and delta_x_flat is not None:
+        # 从 volume_render 复用逻辑计算 weights
+        dists = z_vals[:, 1:] - z_vals[:, :-1]
+        dists = torch.cat([dists, torch.full_like(dists[:, :1], 1e10)], dim=-1)
+        dists = dists * torch.norm(rays_d[:, None, :], dim=-1)
+        alpha = 1.0 - torch.exp(-sigma * dists)
+        trans = torch.cumprod(
+            torch.cat([torch.ones((alpha.shape[0], 1), device=alpha.device), 1.0 - alpha + 1e-10], dim=-1),
+            dim=-1,
+        )[:, :-1]
+        weights = alpha * trans  # [N_rays, N_samples]
+
+        # 恢复 delta_x 的形状并计算加权平均
+        delta_x = delta_x_flat.view(n_rays, n_samples, 3)
+        mean_delta_x = torch.sum(weights.unsqueeze(-1) * delta_x, dim=1)  # [N_rays, 3]
+        extras['mean_delta_x'] = mean_delta_x
+
+    return rgb_map, depth_map, acc_map, extras
 
 
 def render_image(
