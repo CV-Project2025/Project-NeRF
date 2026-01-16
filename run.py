@@ -935,7 +935,10 @@ def run_part3(cfg, args):
         scene_scale=scene_scale,
     )
     
-    print(f">>> 数据集: 训练集 {len(train_set.images)} 张 | 验证集 {len(val_set.images)} 张 | 测试集 {len(test_set.images)} 张")
+    if not args.eval_only:
+        print(f">>> 数据集: 训练集 {len(train_set.images)} 张 | 验证集 {len(val_set.images)} 张 | 测试集 {len(test_set.images)} 张")
+    else:
+        print(f">>> 数据集: 测试集 {len(test_set.images)} 张")
 
     # 模型初始化
     from src.core import NeuralField
@@ -1306,10 +1309,16 @@ def run_part3(cfg, args):
     # 评估阶段
     import shutil
     import subprocess
+    import json
+    from scipy.spatial.transform import Rotation, Slerp
+    from scipy.interpolate import interp1d
+    
+    # 清理训练集和验证集以节省显存（只保留测试集用于评估）
+    del train_set, val_set
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     
     model.eval()
-    print(f">>> Rendering {test_split} set...")
-    psnrs = []
     
     # 评估时使用固定背景色
     eval_bg_color = torch.ones(3, device=device) if white_bkgd else torch.zeros(3, device=device)
@@ -1318,51 +1327,171 @@ def run_part3(cfg, args):
     picture_dir = os.path.join(log_dir, "picture")
     os.makedirs(picture_dir, exist_ok=True)
     
-    num_renders = len(test_set) if render_n == -1 else min(render_n, len(test_set))
-    
-    with torch.no_grad():
-        for idx in tqdm(range(num_renders), desc="Rendering"):
-            rays_o, rays_d, target, time = test_set.get_image_rays(idx, device)
-            H, W = rays_o.shape[:2]
-            rays_o = rays_o.reshape(-1, 3)
-            rays_d = rays_d.reshape(-1, 3)
-            time = time.expand(H*W, 1)
-
-            pred_chunks = []
-            for i in range(0, rays_o.shape[0], chunk):
-                pred_chunk, _, _, _ = render_rays(
-                    model=model,
-                    rays_o=rays_o[i:i+chunk],
-                    rays_d=rays_d[i:i+chunk],
-                    near=near,
-                    far=far,
-                    n_samples=render_n_samples,
-                    perturb=False,
-                    times=time[i:i+chunk],
-                    density_grid=density_grid,
-                    bg_color=eval_bg_color,
+    # render_n == -1 时：环绕渲染视频
+    if render_n == -1:
+        # 从配置文件读取视频参数
+        n_interp_frames = cfg.get('video_frames', 300)  # 视频总帧数
+        n_rotations = cfg.get('n_rotations', 2)  # 旋转圈数
+        print(f">>> 环绕渲染模式: 生成 {n_interp_frames} 帧，相机绕物体旋转 {n_rotations} 圈，时间 0→1...")
+        
+        # 从配置文件读取相机参数
+        scene_bound = cfg.get('scene_bound', 1.2)
+        radius = scene_bound * 2.0  # 相机环绕半径
+        
+        # 场景中心和相机高度
+        scene_center = cfg.get('scene_center', [0.0, 0.0, 0.0])
+        camera_height = cfg.get('camera_height', 2.8)
+        center = np.array(scene_center)
+        
+        print(f">>> 环绕半径: {radius:.3f}")
+        print(f">>> 场景中心: [{center[0]:.2f}, {center[1]:.2f}, {center[2]:.2f}]")
+        print(f">>> 相机高度: {camera_height:.2f}")
+        
+        # 时间从 0 线性增长到 1
+        interp_times = np.linspace(0.0, 1.0, n_interp_frames)
+        
+        # 相机绕 Z 轴旋转 n_rotations 圈 (0 到 n_rotations × 2π)
+        angles = np.linspace(0.0, n_rotations * 2 * np.pi, n_interp_frames, endpoint=False)
+        
+        # 生成环绕相机位姿
+        interp_poses = np.zeros((n_interp_frames, 4, 4), dtype=np.float32)
+        for i, angle in enumerate(angles):
+            # 相机位置：在 XY 平面上绕场景中心旋转
+            x = center[0] + radius * np.cos(angle)
+            y = center[1] + radius * np.sin(angle)
+            z = camera_height  # 保持恒定高度
+            cam_pos = np.array([x, y, z])
+            
+            # 相机朝向场景中心（look-at）
+            forward = center - cam_pos
+            forward = forward / np.linalg.norm(forward)
+            
+            # 世界坐标系的上方向
+            world_up = np.array([0.0, 0.0, 1.0])
+            right = np.cross(forward, world_up)
+            right = right / (np.linalg.norm(right) + 1e-8)
+            up = np.cross(right, forward)
+            up = up / np.linalg.norm(up)
+            
+            # 构建旋转矩阵 (NeRF 相机坐标系: x=right, y=up, z=-forward)
+            R = np.stack([right, up, -forward], axis=1)  # [3, 3]
+            
+            interp_poses[i, :3, :3] = R
+            interp_poses[i, :3, 3] = cam_pos
+            interp_poses[i, 3, 3] = 1.0
+        
+        # 渲染插值帧
+        H, W = test_set.H, test_set.W
+        focal = test_set.focal
+        
+        with torch.no_grad():
+            for idx in tqdm(range(n_interp_frames), desc="Interpolated Rendering"):
+                # 构建光线
+                c2w = torch.tensor(interp_poses[idx], dtype=torch.float32, device=device)
+                t = torch.tensor([[interp_times[idx]]], dtype=torch.float32, device=device)
+                
+                # 生成光线（与 dataset 中相同的逻辑）
+                j, i = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
+                dirs = torch.stack([
+                    (i - W * 0.5) / focal,
+                    -(j - H * 0.5) / focal,
+                    -torch.ones_like(i),
+                ], dim=-1).reshape(-1, 3)
+                
+                rays_d = torch.matmul(dirs, c2w[:3, :3].T)
+                rays_d = rays_d / torch.norm(rays_d, dim=-1, keepdim=True)
+                rays_o = c2w[:3, 3].expand_as(rays_d)
+                if test_set.scene_scale != 1.0:
+                    rays_o = rays_o * test_set.scene_scale
+                
+                time_batch = t.expand(H*W, 1)
+                
+                # 分块渲染
+                pred_chunks = []
+                for i in range(0, rays_o.shape[0], chunk):
+                    pred_chunk, _, _, _ = render_rays(
+                        model=model,
+                        rays_o=rays_o[i:i+chunk],
+                        rays_d=rays_d[i:i+chunk],
+                        near=near,
+                        far=far,
+                        n_samples=render_n_samples,
+                        perturb=False,
+                        times=time_batch[i:i+chunk],
+                        density_grid=density_grid,
+                        bg_color=eval_bg_color,
+                    )
+                    pred_chunks.append(pred_chunk)
+                
+                pred = torch.cat(pred_chunks, dim=0).reshape(H, W, 3)
+                pred = torch.clamp(pred, 0.0, 1.0)
+                
+                plt.imsave(
+                    os.path.join(picture_dir, f"frame_{idx:03d}.png"),
+                    pred.cpu().numpy(),
                 )
-                pred_chunks.append(pred_chunk)
-            
-            pred = torch.cat(pred_chunks, dim=0).reshape(H, W, 3)
-            pred = torch.clamp(pred, 0.0, 1.0)
-            psnr = compute_psnr_torch(pred, target)
-            psnrs.append(psnr)
-            
-            # 保存为连续编号的帧（用于生成视频）
-            plt.imsave(
-                os.path.join(picture_dir, f"frame_{idx:03d}.png"),
-                pred.cpu().numpy(),
-            )
-            # 同时保存带时间戳的版本
-            plt.imsave(
-                os.path.join(render_dir, f"{test_split}_{idx:03d}_t{time[0,0].item():.2f}.png"),
-                pred.cpu().numpy(),
-            )
+                
+                # 清理显存防止泄漏
+                del pred, pred_chunks, rays_o, rays_d, time_batch, c2w, t, dirs
+                torch.cuda.empty_cache()
+        
+        print(f">>> 插值渲染完成！共 {n_interp_frames} 帧")
+        psnrs = []  # 插值模式没有 ground truth，无法计算 PSNR
+    else:
+        # 正常模式：渲染指定数量的测试集帧
+        print(f">>> Rendering {test_split} set...")
+        psnrs = []
+        num_renders = min(render_n, len(test_set))
+        
+        with torch.no_grad():
+            for idx in tqdm(range(num_renders), desc="Rendering"):
+                rays_o, rays_d, target, time = test_set.get_image_rays(idx, device)
+                H, W = rays_o.shape[:2]
+                rays_o = rays_o.reshape(-1, 3)
+                rays_d = rays_d.reshape(-1, 3)
+                time = time.expand(H*W, 1)
+
+                pred_chunks = []
+                for i in range(0, rays_o.shape[0], chunk):
+                    pred_chunk, _, _, _ = render_rays(
+                        model=model,
+                        rays_o=rays_o[i:i+chunk],
+                        rays_d=rays_d[i:i+chunk],
+                        near=near,
+                        far=far,
+                        n_samples=render_n_samples,
+                        perturb=False,
+                        times=time[i:i+chunk],
+                        density_grid=density_grid,
+                        bg_color=eval_bg_color,
+                    )
+                    pred_chunks.append(pred_chunk)
+                
+                pred = torch.cat(pred_chunks, dim=0).reshape(H, W, 3)
+                pred = torch.clamp(pred, 0.0, 1.0)
+                psnr = compute_psnr_torch(pred, target)
+                psnrs.append(psnr)
+                
+                # 保存为连续编号的帧（用于生成视频）
+                plt.imsave(
+                    os.path.join(picture_dir, f"frame_{idx:03d}.png"),
+                    pred.cpu().numpy(),
+                )
+                # 同时保存带时间戳的版本
+                plt.imsave(
+                    os.path.join(render_dir, f"{test_split}_{idx:03d}_t{time[0,0].item():.2f}.png"),
+                    pred.cpu().numpy(),
+                )
+                
+                del pred, pred_chunks, rays_o, rays_d, target, time
+                torch.cuda.empty_cache()
+        
+        num_frames = num_renders
 
     avg_psnr = float(np.mean(psnrs)) if psnrs else 0.0
-    print(f"\n>>> Test PSNR: {avg_psnr:.2f} dB")
-    print(f">>> Rendered images saved to: {render_dir}")
+    if psnrs:
+        print(f"\n>>> Test PSNR: {avg_psnr:.2f} dB")
+    print(f">>> Rendered images saved to: {picture_dir}")
     
     # 使用 ffmpeg 生成视频
     dataset_name = os.path.basename(args.data_dir)
@@ -1381,7 +1510,7 @@ def run_part3(cfg, args):
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode == 0:
             print(f">>> 视频已保存: {video_path}")
-            print(f">>> 视频时长: {num_renders/24:.1f}秒 ({num_renders} 帧 @ 24fps)")
+            print(f">>> 视频时长: {n_interp_frames/24:.1f}秒 ({n_interp_frames} 帧 @ 24fps)")
             
             # 删除临时图片目录
             shutil.rmtree(picture_dir)
@@ -1405,7 +1534,7 @@ if __name__ == "__main__":
         action="store_true",
         help="仅渲染测试集，不进行训练（需 --checkpoint）",
     )
-    parser.add_argument("--render_n", type=int, default=-1, help="评估时渲染的测试集图片数量，如果为 -1 则渲染全部") 
+    parser.add_argument("--render_n", type=int, default=-1, help="评估时渲染的测试集图片数量，如果为 -1 则插值渲染 300 帧") 
     parser.add_argument("--render_chunk", type=int, help="覆盖渲染 chunk 大小")
     args = parser.parse_args()
 
