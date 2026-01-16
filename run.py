@@ -922,15 +922,31 @@ def run_part3(cfg, args):
         print(">>> 开始训练 Part 3 (Dynamic NeRF)...")
         print(f">>> tensorboard --logdir={os.path.join(log_dir, 'tensorboard')} 查看 TensorBoard 日志")
         
-        # ======== 数据增强配置 ========
-        # B. 随机背景增强（学界标准做法：每 batch 随机一个颜色）
+        # ======== 正则化和数据增强配置 ========
+        
+        # A. TV Loss (Total Variation) - 惩罚 HashGrid 相邻特征之间的差异，消除边缘毛刺和浮点噪声
+        use_tv_loss = cfg.get('use_tv_loss', True) and canonical_type == 'instant'
+        tv_loss_weight = cfg.get('tv_loss_weight', 1e-6)
+        
+        # B. 时间平滑正则化 - 确保运动在时间轴上二阶导数微小
+        use_temporal_smooth = cfg.get('use_temporal_smooth', True)
+        temporal_smooth_weight = cfg.get('temporal_smooth_weight', 1e-4)
+        temporal_epsilon = cfg.get('temporal_epsilon', 0.02)  # 时间差 ε
+        temporal_n_samples = cfg.get('temporal_n_samples', 256)  # 采样点数
+        
+        # C. 随机背景增强，每 batch 随机一个颜色
         use_random_bg = cfg.get('use_random_bg', False)
         
-        # C. 无监督一致性约束
+        # D. 无监督一致性约束（体积守恒）
         use_unsup_consistency = cfg.get('use_unsupervised_consistency', False)
         unsup_consistency_weight = cfg.get('unsup_consistency_weight', 0.001)
         unsup_n_samples = cfg.get('unsup_n_samples', 512)
         
+        # 打印配置信息
+        if use_tv_loss:
+            print(f">>> 正则化: TV Loss 已启用 (weight={tv_loss_weight:.0e}, 消除空间噪声)")
+        if use_temporal_smooth:
+            print(f">>> 正则化: 时间平滑已启用 (weight={temporal_smooth_weight:.0e}, ε={temporal_epsilon}, 消除时间抖动)")
         if use_random_bg:
             print(f">>> 数据增强: 随机背景颜色已启用 (每 batch 随机 RGB)")
         if cfg.get('use_coord_noise', False):
@@ -984,9 +1000,43 @@ def run_part3(cfg, args):
                 mean_delta_x = extras['mean_delta_x'] # 从 extras 获取加权平均变形量
                 loss_reg = torch.mean(mean_delta_x ** 2) * deformation_reg_weight
                 
-                # ======== C. 无监督一致性约束 ========
-                # 对随机时刻的变形场施加约束，要求位移均值趋近于 0
-                # 因为全局体积应该保持守恒，物体不应该凭空膨胀或收缩
+                # TV Loss (Total Variation) - 惩罚 HashGrid 哈希表中相邻条目的特征差异
+                loss_tv = torch.tensor(0.0, device=device)
+                if use_tv_loss and hasattr(model, 'canonical_repr') and hasattr(model.canonical_repr, 'encoding'):
+                    # 获取 HashGrid 的可学习参数
+                    hash_params = model.canonical_repr.encoding.params  # [N_entries, n_features]
+                    
+                    # 计算相邻哈希条目之间的 L1 差异 (TV 范数) 并惩罚
+                    tv_diff = torch.abs(hash_params[1:] - hash_params[:-1])  # [N-1, n_features]
+                    loss_tv = torch.mean(tv_diff) * tv_loss_weight
+                
+                # 时间平滑正则化 - 要求运动在时间轴上是二阶导数微小的
+                loss_temporal = torch.tensor(0.0, device=device)
+                # 每 2 步计算一次，减少计算开销
+                if use_temporal_smooth and step > grid_warmup_iters and step % 2 == 0:
+                    n_temp = temporal_n_samples
+                    scene_bound = cfg.get('scene_bound', 1.2)
+                    
+                    # 随机采样空间点（在场景边界内）
+                    x_temp = (torch.rand(n_temp, 3, device=device) * 2 - 1) * scene_bound
+                    
+                    # 随机采样时间点 t，确保 t+ε 仍在 [0, 1] 范围内
+                    t_temp = torch.rand(n_temp, 1, device=device) * (1.0 - temporal_epsilon)
+                    t_temp_eps = t_temp + temporal_epsilon
+                    
+                    # 计算同一点在两个相邻时刻的位移
+                    feat_x_temp = model.pos_encoder_for_deform(x_temp)
+                    feat_t_temp = model.time_encoder(t_temp)
+                    feat_t_temp_eps = model.time_encoder(t_temp_eps)
+                    
+                    delta_x_t = model.deform_net(feat_x_temp, feat_t_temp)        # D(x, t)
+                    delta_x_t_eps = model.deform_net(feat_x_temp, feat_t_temp_eps)  # D(x, t+ε)
+                    
+                    # 使用 L2 范数惩罚差异
+                    loss_temporal = torch.mean((delta_x_t - delta_x_t_eps) ** 2) * temporal_smooth_weight * 2  # *2 补偿采样频率
+                
+                # 无监督一致性约束（体积守恒）
+                # 对随机时刻的变形场施加约束，要求位移均值趋近于 0。因为全局体积应该保持守恒，物体不应该凭空膨胀或收缩
                 loss_unsup = torch.tensor(0.0, device=device)
                 # 每 4 步计算一次，减少计算开销
                 if use_unsup_consistency and step > grid_warmup_iters and step % 4 == 0:
@@ -1003,7 +1053,7 @@ def run_part3(cfg, args):
                     # 约束：变形量的全局均值应趋近于 0（体积守恒）
                     loss_unsup = torch.mean(torch.abs(delta_x_rand.mean(dim=0))) * unsup_consistency_weight * 4  # *4 补偿采样频率
                 
-                total_loss = loss_rgb + loss_reg + loss_unsup
+                total_loss = loss_rgb + loss_reg + loss_tv + loss_temporal + loss_unsup
 
             optimizer.zero_grad()
             # 性能优化：使用混合精度反向传播
@@ -1021,6 +1071,8 @@ def run_part3(cfg, args):
             # 分离loss值，防止保留计算图
             loss_rgb_val = loss_rgb.item()
             loss_reg_val = loss_reg.item()
+            loss_tv_val = loss_tv.item() if use_tv_loss else 0.0
+            loss_temporal_val = loss_temporal.item() if use_temporal_smooth else 0.0
             loss_unsup_val = loss_unsup.item() if use_unsup_consistency else 0.0
             total_loss_val = total_loss.item()
             
@@ -1064,11 +1116,20 @@ def run_part3(cfg, args):
                 skip_info = ""
                 if density_grid is not None:
                     skip_info = f" | Skip: {(1-active_ratio)*100:.1f}%"
-                unsup_info = f" | Unsup: {loss_unsup_val:.6f}" if use_unsup_consistency else ""
+                
+                # 构建附加损失信息字符串
+                aux_loss_info = ""
+                if use_tv_loss:
+                    aux_loss_info += f" | TV: {loss_tv_val:.2e}"
+                if use_temporal_smooth:
+                    aux_loss_info += f" | Temp: {loss_temporal_val:.2e}"
+                if use_unsup_consistency:
+                    aux_loss_info += f" | Unsup: {loss_unsup_val:.2e}"
+                
                 print(
                     f">>> Step {step}/{train_iters} | "
-                    f"RGB Loss {loss_rgb_val:.6f} | "
-                    f"Reg Loss {loss_reg_val:.9f}{unsup_info} | "
+                    f"RGB {loss_rgb_val:.6f} | "
+                    f"Reg {loss_reg_val:.9f}{aux_loss_info} | "
                     f"PSNR {psnr:.2f} dB | "
                     f"LR {current_lr:.6f}{skip_info}"
                 )
@@ -1079,6 +1140,10 @@ def run_part3(cfg, args):
                 tb_logger.log_scalar('Train/Total_Loss', total_loss_val, step)
                 tb_logger.log_scalar('Train/PSNR', psnr, step)
                 tb_logger.log_scalar('Train/LearningRate', current_lr, step)
+                if use_tv_loss:
+                    tb_logger.log_scalar('Train/TV_Loss', loss_tv_val, step)
+                if use_temporal_smooth:
+                    tb_logger.log_scalar('Train/Temporal_Loss', loss_temporal_val, step)
                 if use_unsup_consistency:
                     tb_logger.log_scalar('Train/Unsup_Loss', loss_unsup_val, step)
                 if density_grid is not None:
