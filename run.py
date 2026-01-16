@@ -947,6 +947,14 @@ def run_part3(cfg, args):
             total_loss.backward()
             optimizer.step()
             
+            # 分离loss值，防止保留计算图
+            loss_rgb_val = loss_rgb.item()
+            loss_reg_val = loss_reg.item()
+            total_loss_val = total_loss.item()
+            
+            # 只删除extras避免累积，其他变量让Python自动管理
+            del extras
+            
             if density_grid is not None and density_grid.should_update(step, grid_update_interval, grid_warmup_iters):
                 model.eval()
                 # 随机采样一个时刻进行增量更新,多次迭代后会自动形成运动轨迹的时空并集
@@ -1034,6 +1042,10 @@ def run_part3(cfg, args):
                 
                 # 记录验证集 PSNR 到 TensorBoard
                 tb_logger.log_scalar('Validation/PSNR', avg_val_psnr, step)
+                
+                plt.close('all')
+                if device.type == 'cuda':
+                    torch.cuda.empty_cache()
                 
                 # 只在验证集PSNR提升时保存模型
                 if avg_val_psnr > best_val_psnr:
