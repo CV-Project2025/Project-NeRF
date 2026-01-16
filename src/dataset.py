@@ -170,12 +170,56 @@ class BlenderDataset:
 class DynamicDataset(BlenderDataset):
     """动态场景数据集，继承自 BlenderDataset 并增加时间戳支持"""
     def __init__(self, root_dir, split="train", downscale=1, white_bkgd=True, scene_scale=1.0):
-        super().__init__(root_dir, split, downscale, white_bkgd, scene_scale)
+        # 先调用父类初始化
+        self.root_dir = root_dir
+        self.split = split
+        self.downscale = max(int(downscale), 1)
+        self.white_bkgd = white_bkgd
+        self.scene_scale = float(scene_scale)
         
-        # 尝试从元数据中提取时间戳
+        # 读取相机参数和图像元数据
+        meta_path = os.path.join(root_dir, f"transforms_{split}.json")
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        
+        self.camera_angle_x = float(meta["camera_angle_x"])
+        self.frames = meta["frames"]
+        
+        # 加载所有图像和位姿，保留 alpha 通道用于随机背景增强
+        images_rgb = []
+        images_alpha = []
+        poses = []
         times = []
+        
         for i, frame in enumerate(self.frames):
-            # 如果元数据中有 'time' 字段，则直接使用
+            file_path = frame["file_path"]
+            if file_path.startswith("./"):
+                file_path = file_path[2:]
+            
+            img_path = os.path.join(root_dir, file_path)
+            if not os.path.splitext(img_path)[1]:
+                if os.path.exists(img_path + ".png"):
+                    img_path += ".png"
+                elif os.path.exists(img_path + ".jpg"):
+                    img_path += ".jpg"
+            
+            img = Image.open(img_path).convert("RGBA")
+            if self.downscale > 1:
+                img = img.resize(
+                    (img.width // self.downscale, img.height // self.downscale),
+                    Image.LANCZOS,
+                )
+            
+            img = np.array(img).astype(np.float32) / 255.0
+            rgb = img[..., :3]
+            alpha = img[..., 3:4]
+            
+            # 保存原始 RGB 和 alpha（不合成背景）
+            images_rgb.append(torch.from_numpy(rgb))
+            images_alpha.append(torch.from_numpy(alpha))
+            poses.append(torch.tensor(frame["transform_matrix"], dtype=torch.float32))
+            
+            # 提取时间戳
             if 'time' in frame:
                 times.append(frame['time'])
             else:
@@ -186,7 +230,20 @@ class DynamicDataset(BlenderDataset):
                 else:
                     times.append(0.0)
         
+        self.images_rgb = torch.stack(images_rgb, dim=0)   # [N, H, W, 3] 原始 RGB
+        self.images_alpha = torch.stack(images_alpha, dim=0)  # [N, H, W, 1] alpha 通道
+        self.poses = torch.stack(poses, dim=0)
         self.times = torch.tensor(times, dtype=torch.float32)
+        self.H, self.W = self.images_rgb.shape[1:3]
+        
+        # 为了兼容父类方法，创建一个合成后的 images（使用默认背景）
+        if self.white_bkgd:
+            self.images = self.images_rgb * self.images_alpha + (1.0 - self.images_alpha)
+        else:
+            self.images = self.images_rgb * self.images_alpha
+        
+        self.focal = 0.5 * self.W / np.tan(0.5 * self.camera_angle_x)
+        self._directions = self._build_directions()
 
     def get_image_rays(self, index, device):
         """获取指定图像的所有光线、目标颜色和对应的时间戳"""
@@ -196,7 +253,14 @@ class DynamicDataset(BlenderDataset):
         return rays_o.to(device), rays_d.to(device), target.to(device), time.to(device)
 
     def sample_random_rays(self, batch_size, device):
-        """随机采样光线用于训练，并返回对应的时间戳"""
+        """随机采样光线用于训练，并返回对应的时间戳
+        
+        返回:
+            rays_o: [B, 3] 光线起点
+            rays_d: [B, 3] 光线方向
+            target: [B, 4] 目标 RGBA (前3通道RGB, 第4通道Alpha)
+            times: [B, 1] 时间戳
+        """
         img_idx = torch.randint(0, len(self), (batch_size,))
         pix_y = torch.randint(0, self.H, (batch_size,))
         pix_x = torch.randint(0, self.W, (batch_size,))
@@ -213,10 +277,14 @@ class DynamicDataset(BlenderDataset):
         if self.scene_scale != 1.0:
             rays_o = rays_o * self.scene_scale
 
-        target = self.images[img_idx, pix_y, pix_x]
+        # 获取原始 RGBA（合并为单个 tensor，向后兼容）
+        target_rgb = self.images_rgb[img_idx, pix_y, pix_x]   # [B, 3]
+        target_alpha = self.images_alpha[img_idx, pix_y, pix_x]  # [B, 1]
+        target_rgba = torch.cat([target_rgb, target_alpha], dim=-1)  # [B, 4]
+        
         rays_d = rays_d / torch.norm(rays_d, dim=-1, keepdim=True)
         
         # 获取时间戳并调整形状为 [batch_size, 1]
         times = self.times[img_idx].unsqueeze(-1)
 
-        return rays_o.to(device), rays_d.to(device), target.to(device), times.to(device)
+        return rays_o.to(device), rays_d.to(device), target_rgba.to(device), times.to(device)
