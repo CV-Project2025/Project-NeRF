@@ -33,7 +33,7 @@ class DensityGrid(nn.Module):
         self.offset = bound
 
     @torch.no_grad()
-    def update(self, model, n_samples=128**3, device='cuda', time=None, decay=0.95):
+    def update(self, model, n_samples=128**3, device='cuda', time=None, decay=1.0):
         """
         更新占据网格：通过询问 model 各点的密度值，更新 grid 和 binary_grid
         part 3 时空并集更新：保留历史轨迹，取最大值
@@ -43,7 +43,7 @@ class DensityGrid(nn.Module):
             n_samples: 采样点数（默认采样所有网格中心）
             device: 要求 cuda
             time: 时间参数 [1, 1]（仅 Part 3 动态模型需要，随机采样时刻）
-            decay: 衰减系数（0.95），让旧的密度慢慢消失
+            decay: 衰减系数（默认 1.0 = 永久记忆），只要物体去过的地方永远标记为活跃
         """
         # 生成网格中心点坐标
         x = torch.linspace(-self.bound, self.bound, self.resolution, device=device)
@@ -86,7 +86,7 @@ class DensityGrid(nn.Module):
         # 重塑为 3D 网格（当前时刻）
         current_grid = all_densities.reshape(self.resolution, self.resolution, self.resolution)
         
-        # 时空并集：取历史网格（衰减后）和当前网格的最大值，让网格覆盖物体在整个时间段内运动的所有"路径"
+        # 严格时空并集 - 只要过去有或现在有，就标为活跃，确保网格覆盖整个运动轨迹
         mode = getattr(model, 'mode', 'unknown')
         if mode == 'part3':
             # 保留历史 + 当前时刻取最大值
@@ -171,10 +171,13 @@ def sample_stratified(near, far, n_samples, n_rays, device, perturb):
     return z_vals
 
 
-def volume_render(rgb, sigma, z_vals, rays_d, white_bkgd):
+def volume_render(rgb, sigma, z_vals, rays_d, bg_color=None):
     """
     体渲染：根据 RGB 和密度计算最终像素颜色
-    公式: C(r) = Σ T_i * (1 - exp(-σ_i * δ_i)) * c_i
+    公式: C(r) = Σ T_i * (1 - exp(-σ_i * δ_i)) * c_i + (1 - acc) * bg_color
+    
+    Args:
+        bg_color: 背景颜色 [3] 或 [N_rays, 3]，默认为黑色
     """
     # 计算采样点间距
     dists = z_vals[:, 1:] - z_vals[:, :-1]
@@ -194,9 +197,12 @@ def volume_render(rgb, sigma, z_vals, rays_d, white_bkgd):
     depth_map = torch.sum(weights * z_vals, dim=-1)  # 深度
     acc_map = torch.sum(weights, dim=-1)  # 累积不透明度
 
-    # 白色背景合成
-    if white_bkgd:
-        rgb_map = rgb_map + (1.0 - acc_map)[..., None]
+    # 背景合成：C = C_pred + (1 - acc) * bg_color
+    if bg_color is not None:
+        # bg_color 可以是 [3] 或 [N_rays, 3]
+        if bg_color.dim() == 1:
+            bg_color = bg_color.unsqueeze(0)  # [1, 3]
+        rgb_map = rgb_map + (1.0 - acc_map)[..., None] * bg_color
 
     return rgb_map, depth_map, acc_map
 
@@ -209,9 +215,10 @@ def render_rays(
     far,
     n_samples,
     perturb,
-    white_bkgd,
     density_grid=None,  # Instant-NeRF 使用 density_grid
     times=None,
+    white_bkgd=True,  # 向后兼容：是否使用白色背景
+    bg_color=None,  # 背景颜色 [3] 或 [N_rays, 3]，优先级高于 white_bkgd
 ):
     """
     渲染一批光线
@@ -220,6 +227,8 @@ def render_rays(
     Args:
         density_grid: DensityGrid 实例（可选），将使用空域跳跃优化，只查询活跃区域。
         times: [N_rays, 1] 时间戳（可选），用于时变场景渲染。(仅 part3)
+        white_bkgd: 向后兼容参数，True=白色背景，False=黑色背景
+        bg_color: 背景颜色 [3] 或 [N_rays, 3]，如果提供则覆盖 white_bkgd
     
     Returns:
         如果 times 为 None (静态): (rgb_map, depth_map, acc_map)
@@ -228,6 +237,13 @@ def render_rays(
     device = rays_o.device
     n_rays = rays_o.shape[0]
     mode = getattr(model, 'mode', 'unknown')
+    
+    # 向后兼容：将 white_bkgd 转换为 bg_color
+    if bg_color is None:
+        if white_bkgd:
+            bg_color = torch.ones(3, device=device)  # 白色
+        else:
+            bg_color = torch.zeros(3, device=device)  # 黑色
 
     # 兼容性检查与时间处理
     if mode == "part3":
@@ -310,8 +326,8 @@ def render_rays(
         rgb = rgb_flat.float().view(n_rays, n_samples, 3)
         sigma = sigma_flat.float().view(n_rays, n_samples)
 
-    # 体渲染
-    rgb_map, depth_map, acc_map = volume_render(rgb, sigma, z_vals, rays_d, white_bkgd)
+    # 体渲染（直接传入 bg_color）
+    rgb_map, depth_map, acc_map = volume_render(rgb, sigma, z_vals, rays_d, bg_color=bg_color)
 
     # 动态返回值：根据是否提供 times 参数决定返回格式，保持向后兼容
     if times is not None:
