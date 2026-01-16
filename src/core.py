@@ -1,3 +1,4 @@
+import torch
 import torch.nn as nn
 from .embeddings import FourierRepresentation, HashRepresentation
 from .decoders import StandardMLP, NeRFDecoder, InstantNeRFDecoder, DeformationNetwork
@@ -7,6 +8,11 @@ class NeuralField(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.mode = config["mode"]
+        
+        # Part 3 专用：坐标噪声增强配置
+        self.use_coord_noise = config.get('use_coord_noise', False)
+        self.coord_noise_std = config.get('coord_noise_std', 0.005)
+        self.time_noise_std = config.get('time_noise_std', 0.02)
         
         # Part 1 和 Part 2 标准模式需要的参数
         use_pe = config.get('use_positional_encoding', True)
@@ -100,8 +106,9 @@ class NeuralField(nn.Module):
                     per_level_scale=config.get('per_level_scale', 1.5),
                     bound=config.get('scene_bound', 1.0)
                 )
+                # 将时间特征拼接到规范空间特征中
                 self.decoder = InstantNeRFDecoder(
-                    pos_dim=self.canonical_repr.out_dim,
+                    pos_dim=self.canonical_repr.out_dim + self.time_encoder.out_dim,
                     dir_dim=self.dir_representation.out_dim,
                     hidden_dim=config.get('hidden_dim', 64)
                 )
@@ -109,8 +116,9 @@ class NeuralField(nn.Module):
                 # 使用 Fourier MLP 作为规范空间的表示
                 L_canon = config.get('L_embed_canon', 10)
                 self.canonical_repr = FourierRepresentation(input_dim=3, L=L_canon, use_encoding=True)
+                # 将时间特征拼接到规范空间特征中
                 self.decoder = NeRFDecoder(
-                    pos_dim=self.canonical_repr.out_dim,
+                    pos_dim=self.canonical_repr.out_dim + self.time_encoder.out_dim,
                     dir_dim=self.dir_representation.out_dim,
                     hidden_dim=config.get('hidden_dim', 256),
                     num_layers=config.get('num_layers', 8),
@@ -128,16 +136,35 @@ class NeuralField(nn.Module):
             if t is None:
                 raise ValueError("Part 3 requires time input 't'.")
             
-            # 变形阶段
-            feat_t = self.time_encoder(t)                     # embed(t)
-            feat_x = self.pos_encoder_for_deform(x)           # embed(x) for deformation
-            delta_x = self.deform_net(feat_x, feat_t)         # DeformationNet(feat_x, feat_t)
-            x_canonical = x + delta_x                         # x_canonical = x + Δx
+            # ======== A. 坐标噪声增强 ========
+            # 在训练阶段给 DeformNet 的输入注入微小噪声
+            # 强制模型在 x±ε 范围内输出相似位移，增强变形场平滑性
+            x_deform = x
+            t_deform = t
+            if self.training and self.use_coord_noise:
+                # 坐标噪声: x' = x + N(0, σ_coord)
+                if self.coord_noise_std > 0:
+                    x_deform = x + torch.randn_like(x) * self.coord_noise_std
+                # 时间噪声: t' = t + N(0, σ_time)
+                if self.time_noise_std > 0:
+                    t_deform = t + torch.randn_like(t) * self.time_noise_std
+                    # 时间归一化到 [0, 1]，需要 clamp 防止越界
+                    t_deform = torch.clamp(t_deform, 0.0, 1.0)
+            
+            # 变形阶段 - 使用可能带噪声的输入
+            feat_t = self.time_encoder(t_deform)              # embed(t')
+            feat_x = self.pos_encoder_for_deform(x_deform)    # embed(x') for deformation
+            delta_x = self.deform_net(feat_x, feat_t)         # DeformationNet(feat_x', feat_t')
+            x_canonical = x + delta_x                         # x_canonical = x + Δx (注意：这里用原始 x)
 
             # 规范渲染阶段
             feat_can = self.canonical_repr(x_canonical)       # embed_canonical(x_canonical)
             feat_d = self.dir_representation(d)               # embed_dir(d)
-            rgb, sigma = self.decoder(feat_can, feat_d)       # CanonicalNet(feat_can, feat_d)
+            
+            # 将时间特征拼接到规范空间特征中，增强时变光影处理能力
+            # feat_combined = [x_can_features, time_features]
+            h_combined = torch.cat([feat_can, feat_t], dim=-1)
+            rgb, sigma = self.decoder(h_combined, feat_d)     # CanonicalNet(feat_combined, feat_d)
 
             # 返回 rgb, sigma, Δx
             return rgb, sigma, delta_x

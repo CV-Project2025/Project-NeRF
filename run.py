@@ -909,9 +909,34 @@ def run_part3(cfg, args):
         tb_logger = TensorBoardLogger(tb_dir)
         
         optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+        
+        # TiNeuVox 改进：使用 CosineAnnealingLR 调度器，防止训练后期 PSNR 震荡
+        # 从初始学习率平滑降至 eta_min
+        eta_min = cfg.get('eta_min', 1e-4)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=train_iters, eta_min=eta_min)
+        
+        use_amp = cfg.get('use_amp', True)
+        scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+        
         loss_fn = nn.MSELoss()
         print(">>> 开始训练 Part 3 (Dynamic NeRF)...")
         print(f">>> tensorboard --logdir={os.path.join(log_dir, 'tensorboard')} 查看 TensorBoard 日志")
+        
+        # ======== 数据增强配置 ========
+        # B. 随机背景增强（学界标准做法：每 batch 随机一个颜色）
+        use_random_bg = cfg.get('use_random_bg', False)
+        
+        # C. 无监督一致性约束
+        use_unsup_consistency = cfg.get('use_unsupervised_consistency', False)
+        unsup_consistency_weight = cfg.get('unsup_consistency_weight', 0.001)
+        unsup_n_samples = cfg.get('unsup_n_samples', 512)
+        
+        if use_random_bg:
+            print(f">>> 数据增强: 随机背景颜色已启用 (每 batch 随机 RGB)")
+        if cfg.get('use_coord_noise', False):
+            print(f">>> 数据增强: 坐标噪声已启用 (coord_std={cfg.get('coord_noise_std', 0.005)}, time_std={cfg.get('time_noise_std', 0.02)})")
+        if use_unsup_consistency:
+            print(f">>> 数据增强: 无监督一致性约束已启用 (weight={unsup_consistency_weight}, n_samples={unsup_n_samples})")
         
         # 初始化最佳验证集PSNR跟踪
         best_val_psnr = 0.0
@@ -921,66 +946,141 @@ def run_part3(cfg, args):
         grid_warmup_iters = cfg.get('grid_warmup_iters', 256)
         
         for step in range(1, train_iters + 1):
-            rays_o, rays_d, target, times = train_set.sample_random_rays(batch_size, device)
+            # 采样返回: rays_o, rays_d, target_rgba [B,4], times
+            rays_o, rays_d, target_rgba, times = train_set.sample_random_rays(batch_size, device)
             
-            # 调用修改后的 render_rays，接收 extras
-            pred_rgb, _, _, extras = render_rays(
-                model=model,
-                rays_o=rays_o,
-                rays_d=rays_d,
-                near=near,
-                far=far,
-                n_samples=n_samples,
-                perturb=True,
-                white_bkgd=white_bkgd,
-                times=times,
-                density_grid=density_grid,
-            )
+            # 分离 RGB 和 Alpha 通道
+            target_rgb = target_rgba[:, :3]    # [B, 3]
+            target_alpha = target_rgba[:, 3:4] # [B, 1]
             
-            # A. 辅助损失函数: RGB Loss + Deformation Regularization
-            loss_rgb = loss_fn(pred_rgb, target)
-            mean_delta_x = extras['mean_delta_x'] # 从 extras 获取加权平均变形量
-            loss_reg = torch.mean(mean_delta_x ** 2) * deformation_reg_weight
-            total_loss = loss_rgb + loss_reg
+            # ======== B. 随机背景增强（学界标准做法）========
+            # 每个 batch 生成一个随机背景颜色，同时用于渲染和 target 合成
+            if use_random_bg:
+                bg_color = torch.rand(3, device=device)  # [3] 随机 RGB
+            else:
+                bg_color = torch.ones(3, device=device) if white_bkgd else torch.zeros(3, device=device)
+            
+            # 合成 target: Target = RGB * Alpha + bg_color * (1 - Alpha)
+            target = target_rgb * target_alpha + bg_color * (1.0 - target_alpha)
+            
+            # 性能优化：使用混合精度前向传播
+            with torch.amp.autocast('cuda', enabled=use_amp):
+                # 调用 render_rays，传入相同的 bg_color
+                pred_rgb, _, _, extras = render_rays(
+                    model=model,
+                    rays_o=rays_o,
+                    rays_d=rays_d,
+                    near=near,
+                    far=far,
+                    n_samples=n_samples,
+                    perturb=True,
+                    times=times,
+                    density_grid=density_grid,
+                    bg_color=bg_color,  # 传入随机背景色
+                )
+                
+                # A. 辅助损失函数: RGB Loss + Deformation Regularization
+                loss_rgb = loss_fn(pred_rgb, target)
+                mean_delta_x = extras['mean_delta_x'] # 从 extras 获取加权平均变形量
+                loss_reg = torch.mean(mean_delta_x ** 2) * deformation_reg_weight
+                
+                # ======== C. 无监督一致性约束 ========
+                # 对随机时刻的变形场施加约束，要求位移均值趋近于 0
+                # 因为全局体积应该保持守恒，物体不应该凭空膨胀或收缩
+                loss_unsup = torch.tensor(0.0, device=device)
+                # 每 4 步计算一次，减少计算开销
+                if use_unsup_consistency and step > grid_warmup_iters and step % 4 == 0:
+                    n_unsup = min(unsup_n_samples, 512)
+                    t_rand = torch.rand(n_unsup, 1, device=device)
+                    scene_bound = cfg.get('scene_bound', 1.2)
+                    x_rand = (torch.rand(n_unsup, 3, device=device) * 2 - 1) * scene_bound
+                    
+                    # 仅获取变形场的位移（不需要渲染）
+                    feat_t_rand = model.time_encoder(t_rand)
+                    feat_x_rand = model.pos_encoder_for_deform(x_rand)
+                    delta_x_rand = model.deform_net(feat_x_rand, feat_t_rand)
+                    
+                    # 约束：变形量的全局均值应趋近于 0（体积守恒）
+                    loss_unsup = torch.mean(torch.abs(delta_x_rand.mean(dim=0))) * unsup_consistency_weight * 4  # *4 补偿采样频率
+                
+                total_loss = loss_rgb + loss_reg + loss_unsup
 
             optimizer.zero_grad()
-            total_loss.backward()
-            optimizer.step()
+            # 性能优化：使用混合精度反向传播
+            scaler.scale(total_loss).backward()
+            
+            # 梯度裁剪防止 DeformNet 和 HashGrid 在动态场景中溢出
+            max_grad_norm = cfg.get('max_grad_norm', 1.0)
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+            
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()  # 执行学习率调度
             
             # 分离loss值，防止保留计算图
             loss_rgb_val = loss_rgb.item()
             loss_reg_val = loss_reg.item()
+            loss_unsup_val = loss_unsup.item() if use_unsup_consistency else 0.0
             total_loss_val = total_loss.item()
             
             # 只删除extras避免累积，其他变量让Python自动管理
             del extras
             
-            if density_grid is not None and density_grid.should_update(step, grid_update_interval, grid_warmup_iters):
+            # 性能优化：动态调整网格更新频率
+            # 前 1000 步：每 16 步更新（快速建立包络线）
+            # 1000-5000 步：每 64 步更新（中期优化）
+            # 5000 步后：每 256 步更新（后期微调）
+            if step < 1000:
+                dynamic_interval = 16
+            elif step < 5000:
+                dynamic_interval = 64
+            else:
+                dynamic_interval = 256
+            
+            if density_grid is not None and density_grid.should_update(step, dynamic_interval, grid_warmup_iters):
                 model.eval()
-                # 随机采样一个时刻进行增量更新,多次迭代后会自动形成运动轨迹的时空并集
+                # TiNeuVox 改进：暴力时空更新 - 一次性采样多个时间点，让网格形成完整的"运动包络线"
                 time_min = train_set.times.min().item()
                 time_max = train_set.times.max().item()
-                rand_time = torch.rand(1, 1, device=device) * (time_max - time_min) + time_min
-                active_ratio = density_grid.update(model, device=device, time=rand_time, decay=0.95)
+                # 根据训练阶段动态调整采样密度
+                n_time_samples = 16 if step < 1000 else 8
+                update_times = torch.linspace(time_min, time_max, steps=n_time_samples, device=device)
+                
+                for i, t_val in enumerate(update_times):
+                    # 完全禁用衰减：严格时空并集，永久保留所有时刻的密度
+                    active_ratio = density_grid.update(
+                        model, 
+                        device=device, 
+                        time=t_val.view(1, 1), 
+                        decay=1.0  # 完全保留
+                    )
+                
                 model.train()
 
             if step % log_every == 0:
-                psnr = compute_psnr(loss_rgb.item())
+                psnr = compute_psnr(loss_rgb_val)
+                current_lr = scheduler.get_last_lr()[0]
                 skip_info = ""
                 if density_grid is not None:
                     skip_info = f" | Skip: {(1-active_ratio)*100:.1f}%"
+                unsup_info = f" | Unsup: {loss_unsup_val:.6f}" if use_unsup_consistency else ""
                 print(
                     f">>> Step {step}/{train_iters} | "
-                    f"RGB Loss {loss_rgb.item():.6f} | "
-                    f"Reg Loss {loss_reg.item():.9f} | "
-                    f"PSNR {psnr:.2f} dB{skip_info}"
+                    f"RGB Loss {loss_rgb_val:.6f} | "
+                    f"Reg Loss {loss_reg_val:.9f}{unsup_info} | "
+                    f"PSNR {psnr:.2f} dB | "
+                    f"LR {current_lr:.6f}{skip_info}"
                 )
                 
                 # 记录到 TensorBoard
-                tb_logger.log_scalar('Train/RGB_Loss', loss_rgb.item(), step)
-                tb_logger.log_scalar('Train/Reg_Loss', loss_reg.item(), step)
-                tb_logger.log_scalar('Train/Total_Loss', total_loss.item(), step)
+                tb_logger.log_scalar('Train/RGB_Loss', loss_rgb_val, step)
+                tb_logger.log_scalar('Train/Reg_Loss', loss_reg_val, step)
+                tb_logger.log_scalar('Train/Total_Loss', total_loss_val, step)
                 tb_logger.log_scalar('Train/PSNR', psnr, step)
+                tb_logger.log_scalar('Train/LearningRate', current_lr, step)
+                if use_unsup_consistency:
+                    tb_logger.log_scalar('Train/Unsup_Loss', loss_unsup_val, step)
                 if density_grid is not None:
                     tb_logger.log_scalar('Train/ActiveRatio', active_ratio, step)
             
@@ -992,15 +1092,18 @@ def run_part3(cfg, args):
                 
                 # 随机选择几张验证集图片进行评估和渲染
                 import random
-                n_val_images = min(5, len(val_set.images))
+                n_val_images = min(3, len(val_set.images))  # 减少验证图像数量
                 val_indices = random.sample(range(len(val_set.images)), n_val_images)
                 
                 step_val_dir = os.path.join(val_render_dir, f"step_{step:06d}")
                 os.makedirs(step_val_dir, exist_ok=True)
                 
                 with torch.no_grad():
-                    # 对所有验证集计算PSNR
-                    for idx in range(len(val_set.images)):
+                    # 验证时使用固定白色背景（保证公平对比）
+                    val_bg_color = torch.ones(3, device=device) if white_bkgd else torch.zeros(3, device=device)
+                    
+                    # 只对选中的验证集计算 PSNR（节省显存和时间）
+                    for idx in val_indices:
                         rays_o, rays_d, target, time = val_set.get_image_rays(idx, device)
                         H, W = rays_o.shape[:2]
                         rays_o = rays_o.reshape(-1, 3)
@@ -1019,23 +1122,25 @@ def run_part3(cfg, args):
                                 far=far,
                                 n_samples=render_n_samples,
                                 perturb=False,
-                                white_bkgd=white_bkgd,
                                 times=time[i:i+chunk],
                                 density_grid=density_grid,
+                                bg_color=val_bg_color,  # 固定背景色
                             )
-                            pred_chunks.append(pred_chunk)
+                            pred_chunks.append(pred_chunk.cpu())  # 立即移动到 CPU
                         pred = torch.cat(pred_chunks, dim=0)
-                        val_psnr = compute_psnr_torch(pred, target_flat)
+                        del pred_chunks  # 立即释放
+                        
+                        val_psnr = compute_psnr_torch(pred.to(device), target_flat)
                         val_psnrs.append(val_psnr)
                         
-                        # 保存随机选中的几张图片
-                        if idx in val_indices:
-                            pred_img = pred.reshape(H, W, 3)
-                            pred_img = torch.clamp(pred_img, 0.0, 1.0)
-                            plt.imsave(
-                                os.path.join(step_val_dir, f"val_{idx:03d}_t{time[0,0]:.2f}_psnr{val_psnr:.2f}.png"),
-                                pred_img.cpu().numpy(),
-                            )
+                        # 保存验证图像
+                        pred_img = pred.reshape(H, W, 3)
+                        pred_img = torch.clamp(pred_img, 0.0, 1.0)
+                        plt.imsave(
+                            os.path.join(step_val_dir, f"val_{idx:03d}_t{time[0,0].item():.2f}_psnr{val_psnr:.2f}.png"),
+                            pred_img.numpy(),
+                        )
+                        del pred, target_flat, rays_o, rays_d  # 清理显存
                 
                 avg_val_psnr = float(np.mean(val_psnrs))
                 print(f"    [Validation] PSNR: {avg_val_psnr:.2f} dB", end="")
@@ -1073,13 +1178,24 @@ def run_part3(cfg, args):
             torch.cuda.empty_cache()
 
     # 评估阶段
+    import shutil
+    import subprocess
+    
     model.eval()
     print(f">>> Rendering {test_split} set...")
     psnrs = []
     
+    # 评估时使用固定背景色
+    eval_bg_color = torch.ones(3, device=device) if white_bkgd else torch.zeros(3, device=device)
+    
+    # 创建临时图片目录用于生成视频
+    picture_dir = os.path.join(log_dir, "picture")
+    os.makedirs(picture_dir, exist_ok=True)
+    
+    num_renders = len(test_set) if render_n == -1 else min(render_n, len(test_set))
+    
     with torch.no_grad():
-        num_renders = len(test_set) if render_n == -1 else min(render_n, len(test_set))
-        for idx in range(num_renders):
+        for idx in tqdm(range(num_renders), desc="Rendering"):
             rays_o, rays_d, target, time = test_set.get_image_rays(idx, device)
             H, W = rays_o.shape[:2]
             rays_o = rays_o.reshape(-1, 3)
@@ -1096,9 +1212,9 @@ def run_part3(cfg, args):
                     far=far,
                     n_samples=render_n_samples,
                     perturb=False,
-                    white_bkgd=white_bkgd,
                     times=time[i:i+chunk],
                     density_grid=density_grid,
+                    bg_color=eval_bg_color,
                 )
                 pred_chunks.append(pred_chunk)
             
@@ -1107,14 +1223,49 @@ def run_part3(cfg, args):
             psnr = compute_psnr_torch(pred, target)
             psnrs.append(psnr)
             
+            # 保存为连续编号的帧（用于生成视频）
             plt.imsave(
-                os.path.join(render_dir, f"{test_split}_{idx:03d}_t{time[0,0]:.2f}.png"),
+                os.path.join(picture_dir, f"frame_{idx:03d}.png"),
+                pred.cpu().numpy(),
+            )
+            # 同时保存带时间戳的版本
+            plt.imsave(
+                os.path.join(render_dir, f"{test_split}_{idx:03d}_t{time[0,0].item():.2f}.png"),
                 pred.cpu().numpy(),
             )
 
     avg_psnr = float(np.mean(psnrs)) if psnrs else 0.0
-    print(f">>> Test PSNR: {avg_psnr:.2f} dB")
+    print(f"\n>>> Test PSNR: {avg_psnr:.2f} dB")
     print(f">>> Rendered images saved to: {render_dir}")
+    
+    # 使用 ffmpeg 生成视频
+    dataset_name = os.path.basename(args.data_dir)
+    video_path = os.path.join(log_dir, f"{dataset_name}_24fps.mp4")
+    print(f"\n>>> 使用 ffmpeg 生成视频...")
+    try:
+        cmd = [
+            "ffmpeg", "-y",
+            "-framerate", "24",
+            "-i", os.path.join(picture_dir, "frame_%03d.png"),
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-crf", "18",
+            video_path
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            print(f">>> 视频已保存: {video_path}")
+            print(f">>> 视频时长: {num_renders/24:.1f}秒 ({num_renders} 帧 @ 24fps)")
+            
+            # 删除临时图片目录
+            shutil.rmtree(picture_dir)
+            print(f">>> 已清理临时图片目录")
+        else:
+            print(f"!!! ffmpeg 执行失败:\n{result.stderr}")
+    except FileNotFoundError:
+        print("!!! 未找到 ffmpeg，请先安装: sudo apt install ffmpeg")
+    except Exception as e:
+        print(f"!!! 视频生成失败: {e}")
 
 
 if __name__ == "__main__":
@@ -1128,7 +1279,7 @@ if __name__ == "__main__":
         action="store_true",
         help="仅渲染测试集，不进行训练（需 --checkpoint）",
     )
-    parser.add_argument("--render_n", type=int, default=10, help="评估时渲染的测试集图片数量，如果为 -1 则渲染全部") 
+    parser.add_argument("--render_n", type=int, default=-1, help="评估时渲染的测试集图片数量，如果为 -1 则渲染全部") 
     parser.add_argument("--render_chunk", type=int, help="覆盖渲染 chunk 大小")
     args = parser.parse_args()
 
