@@ -908,7 +908,8 @@ def run_part3(cfg, args):
         tb_dir = os.path.join(log_dir, "tensorboard", get_exp_name(cfg))
         tb_logger = TensorBoardLogger(tb_dir)
         
-        optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+        weight_decay = cfg.get('weight_decay', 1e-5)
+        optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
         
         # TiNeuVox 改进：使用 CosineAnnealingLR 调度器，防止训练后期 PSNR 震荡
         # 从初始学习率平滑降至 eta_min
@@ -1154,11 +1155,12 @@ def run_part3(cfg, args):
             if step % val_every == 0:
                 model.eval()
                 val_psnrs = []
+                val_results = []  # 保存 (idx, psnr, pred_img, time) 用于后续保存
                 
-                # 随机选择几张验证集图片进行评估和渲染
+                # 对全部验证集计算 PSNR，随机保存 5 张图片
                 import random
-                n_val_images = min(3, len(val_set.images))  # 减少验证图像数量
-                val_indices = random.sample(range(len(val_set.images)), n_val_images)
+                n_save_images = min(5, len(val_set.images))
+                save_indices = set(random.sample(range(len(val_set.images)), n_save_images))
                 
                 step_val_dir = os.path.join(val_render_dir, f"step_{step:06d}")
                 os.makedirs(step_val_dir, exist_ok=True)
@@ -1167,8 +1169,8 @@ def run_part3(cfg, args):
                     # 验证时使用固定白色背景（保证公平对比）
                     val_bg_color = torch.ones(3, device=device) if white_bkgd else torch.zeros(3, device=device)
                     
-                    # 只对选中的验证集计算 PSNR（节省显存和时间）
-                    for idx in val_indices:
+                    # 对全部验证集计算 PSNR
+                    for idx in range(len(val_set.images)):
                         rays_o, rays_d, target, time = val_set.get_image_rays(idx, device)
                         H, W = rays_o.shape[:2]
                         rays_o = rays_o.reshape(-1, 3)
@@ -1198,13 +1200,14 @@ def run_part3(cfg, args):
                         val_psnr = compute_psnr_torch(pred.to(device), target_flat)
                         val_psnrs.append(val_psnr)
                         
-                        # 保存验证图像
-                        pred_img = pred.reshape(H, W, 3)
-                        pred_img = torch.clamp(pred_img, 0.0, 1.0)
-                        plt.imsave(
-                            os.path.join(step_val_dir, f"val_{idx:03d}_t{time[0,0].item():.2f}_psnr{val_psnr:.2f}.png"),
-                            pred_img.numpy(),
-                        )
+                        # 只保存随机选中的图片
+                        if idx in save_indices:
+                            pred_img = pred.reshape(H, W, 3)
+                            pred_img = torch.clamp(pred_img, 0.0, 1.0)
+                            plt.imsave(
+                                os.path.join(step_val_dir, f"val_{idx:03d}_t{time[0,0].item():.2f}_psnr{val_psnr:.2f}.png"),
+                                pred_img.numpy(),
+                            )
                         del pred, target_flat, rays_o, rays_d  # 清理显存
                 
                 avg_val_psnr = float(np.mean(val_psnrs))
