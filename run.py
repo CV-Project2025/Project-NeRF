@@ -596,17 +596,20 @@ def run_part2_instant(cfg, args):
             scheduler.step()  # Cosine 衰减
 
             # 动态网格更新：前 10% 步数每 16 步更新，10%-50% 每 64 步，50% 后每 256 步
-            if step < train_iters * 0.1:
-                dynamic_interval = 16
-            elif step < train_iters * 0.5:
-                dynamic_interval = 64
-            else:
-                dynamic_interval = 256
-            
-            if density_grid is not None and density_grid.should_update(step, dynamic_interval, grid_warmup_iters):
-                model.eval()
-                active_ratio = density_grid.update(model, device=device, time=None)
-                model.train()
+            # 训练后期（grid_stop_ratio 后）停止更新
+            grid_stop_ratio = cfg.get('grid_stop_ratio', 0.9)
+            if step < train_iters * grid_stop_ratio:
+                if step < train_iters * 0.1:
+                    dynamic_interval = 16
+                elif step < train_iters * 0.5:
+                    dynamic_interval = 64
+                else:
+                    dynamic_interval = 256
+                
+                if density_grid is not None and density_grid.should_update(step, dynamic_interval, grid_warmup_iters):
+                    model.eval()
+                    active_ratio = density_grid.update(model, device=device, time=None)
+                    model.train()
 
             # 日志输出和 TensorBoard 记录
             if step % log_every == 0:
@@ -1335,8 +1338,7 @@ def run_part3(cfg, args):
         print(f">>> 环绕渲染模式: 生成 {n_interp_frames} 帧，相机绕物体旋转 {n_rotations} 圈，时间 0→1...")
         
         # 从配置文件读取相机参数
-        scene_bound = cfg.get('scene_bound', 1.2)
-        radius = scene_bound * 2.0  # 相机环绕半径
+        radius = cfg.get('camera_radius', 2.4)  # 相机环绕半径
         
         # 场景中心和相机高度
         scene_center = cfg.get('scene_center', [0.0, 0.0, 0.0])

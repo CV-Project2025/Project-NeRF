@@ -15,15 +15,15 @@ scene_scale: 1.0 # 场景缩放
 # ==============================================================================
 near: 2.0 # 光线近裁剪面
 far: 6.0 # 光线远裁剪面
-n_samples: 64 # ⭐ 训练采样点数
+n_samples: 128 # ⭐ 训练采样点数
 render_n_samples: 128 # ⭐评估采样点数
 batch_size: 8192 # ⭐ 训练批大小
-chunk: 20000 # ⭐ 渲染分块
+chunk: 10000 # ⭐ 渲染分块
 
 # ==============================================================================
 # 训练配置
 # ==============================================================================
-train_iters: 20000 # ⭐ 训练总步数
+train_iters: 40000 # ⭐ 训练总步数
 learning_rate: 0.005 # 初始学习率
 weight_decay: 0.00001 # AdamW 权重衰减
 eta_min: 0.0001 # Cosine LR 最小值
@@ -36,8 +36,8 @@ val_every: 500 # 验证频率
 # ==============================================================================
 # 正则化配置
 # ==============================================================================
-deformation_reg_weight: 0.001 # 变形场 L2 正则化
-tv_loss_weight: 0.000001 # TV Loss（消除 HashGrid 噪声）
+deformation_reg_weight: 0.01 # 变形场 L2 正则化
+tv_loss_weight: 0.00001 # TV Loss（消除 HashGrid 噪声）
 use_temporal_smooth: true # 时间平滑正则化
 temporal_smooth_weight: 0.0001 # 时间平滑权重
 temporal_epsilon: 0.02 # 时间扰动 ε
@@ -71,7 +71,7 @@ n_features_per_level: 2 # 每层特征维度
 log2_hashmap_size: 19 # 哈希表大小
 base_resolution: 16 # 最粗层分辨率
 per_level_scale: 1.5 # 层间增长因子
-scene_bound: 1.2 # ⭐ 场景边界（决定相机环绕半径 = scene_bound × 2.0）
+scene_bound: 1.5 # ⭐ 场景边界（决定相机环绕半径 = scene_bound × 2.0）
 hidden_dim: 64 # 解码器隐藏层维度
 
 # Density Grid 配置
@@ -80,6 +80,7 @@ grid_resolution: 128 # 网格分辨率
 grid_threshold: 0.01 # 密度阈值
 grid_update_interval: 32 # 更新间隔
 grid_warmup_iters: 256 # 预热步数
+grid_stop_ratio: 0.9 # 停止更新比例（90%步后冻结网格）
 
 # ==============================================================================
 # 输出与视频配置
@@ -88,6 +89,7 @@ log_dir: "output/part3" # 输出根目录
 
 # 视频渲染配置（--render_n -1 时生效）
 video_frames: 300 # ⭐ 视频总帧数（300帧@24fps=12.5秒）
-n_rotations: 2 # ⭐ 相机旋转圈数
+n_rotations: 1.5 # ⭐ 相机旋转圈数
 scene_center: [0.0, 0.0, 0.0] # ⭐ 场景中心（根据物体位置调整）
-camera_height: 2.0 # ⭐ 相机高度
+camera_height: 2.4 # ⭐ 相机高度
+camera_radius: 3.0 # ⭐ 相机环绕半径（俯视远景增大，特写减小）
