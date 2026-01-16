@@ -277,7 +277,16 @@ def run_part2(cfg, args):
         model.train()
         for step in range(1, train_iters + 1):
             # 随机采样光线并渲染
-            rays_o, rays_d, target = train_set.sample_random_rays(batch_size, device)
+            rays_o, rays_d, target_rgba = train_set.sample_random_rays(batch_size, device)
+            
+            # 分离并合成 target (使用固定背景)
+            target_rgb = target_rgba[:, :3]
+            target_alpha = target_rgba[:, 3:4]
+            if white_bkgd:
+                target = target_rgb * target_alpha + (1.0 - target_alpha)
+            else:
+                target = target_rgb * target_alpha
+            
             pred_rgb, _, _ = render_rays(
                 model=model,
                 rays_o=rays_o,
@@ -498,13 +507,35 @@ def run_part2_instant(cfg, args):
         tb_dir = os.path.join(log_dir, "tensorboard", get_exp_name(cfg))
         tb_logger = TensorBoardLogger(tb_dir)
         
-        optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+        # AdamW 优化器
+        weight_decay = cfg.get('weight_decay', 1e-5)
+        optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+        
+        # Cosine 衰减调度器
+        eta_min = cfg.get('eta_min', 1e-4)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=train_iters, eta_min=eta_min)
+        
+        # 随机背景增强
+        use_random_bg = cfg.get('use_random_bg', False)
+        
+        # TV Loss (Total Variation) - 惩罚 HashGrid 相邻特征差异，消除边缘毛刺
+        use_tv_loss = cfg.get('use_tv_loss', True)
+        tv_loss_weight = float(cfg.get('tv_loss_weight', 1e-6))
+        
         loss_fn = nn.MSELoss()
 
         print(f">>> 目标: {train_iters} 步")
-        print(f">>> 学习率: {learning_rate} ")
+        print(f">>> 学习率: {learning_rate} (Cosine 衰减至 {eta_min})")
         print(f">>> 批量大小: {batch_size}")
         print(f">>> 采样点数: {n_samples} ")
+        if use_tv_loss:
+            print(f">>> 正则化: TV Loss 已启用 (weight={tv_loss_weight:.0e})")
+        if use_random_bg:
+            random_bg_start = cfg.get('random_bg_start', 0)
+            if random_bg_start > 0:
+                print(f">>> 数据增强: 随机背景增强 ({random_bg_start} 步后开启)")
+            else:
+                print(f">>> 数据增强: 随机背景增强 (全程启用)")
         print(f">>> tensorboard --logdir={os.path.join(log_dir, 'tensorboard')} 查看 TensorBoard 日志")
         
         # 初始化最佳验证集PSNR跟踪
@@ -512,8 +543,21 @@ def run_part2_instant(cfg, args):
         
         model.train()
         for step in range(1, train_iters + 1):
-            # 随机采样光线并渲染
-            rays_o, rays_d, target = train_set.sample_random_rays(batch_size, device)
+            # 随机采样光线并渲染 (返回 RGBA 4通道)
+            rays_o, rays_d, target_rgba = train_set.sample_random_rays(batch_size, device)
+            
+            # 分离 RGB 和 Alpha 通道
+            target_rgb = target_rgba[:, :3]    # [B, 3]
+            target_alpha = target_rgba[:, 3:4] # [B, 1]
+            
+            # 随机背景增强：从 random_bg_start 步开始启用
+            if use_random_bg and step >= random_bg_start:
+                bg_color = torch.rand(3, device=device)
+            else:
+                bg_color = torch.ones(3, device=device) if white_bkgd else torch.zeros(3, device=device)
+            
+            # 动态合成 target: RGB * Alpha + bg_color * (1 - Alpha)
+            target = target_rgb * target_alpha + bg_color * (1.0 - target_alpha)
             
             # 使用占据网格加速渲染
             pred_rgb, _, _ = render_rays(
@@ -525,9 +569,19 @@ def run_part2_instant(cfg, args):
                 n_samples=n_samples,
                 perturb=True,
                 white_bkgd=white_bkgd,
-                density_grid=density_grid,  
+                density_grid=density_grid,
+                bg_color=bg_color,
             )
-            loss = loss_fn(pred_rgb, target)
+            loss_rgb = loss_fn(pred_rgb, target)
+            
+            # TV Loss - 惩罚 HashGrid 哈希表中相邻条目的特征差异
+            loss_tv = torch.tensor(0.0, device=device)
+            if use_tv_loss and hasattr(model, 'representation') and hasattr(model.representation, 'encoding'):
+                hash_params = model.representation.encoding.params  # [N_entries, n_features]
+                tv_diff = torch.abs(hash_params[1:] - hash_params[:-1])  # L1 范数
+                loss_tv = torch.mean(tv_diff) * tv_loss_weight
+            
+            loss = loss_rgb + loss_tv
 
             optimizer.zero_grad()
             loss.backward()
@@ -539,16 +593,24 @@ def run_part2_instant(cfg, args):
                 torch.nn.utils.clip_grad_norm_(model.decoder.parameters(), max_norm=1.0)
             
             optimizer.step()
+            scheduler.step()  # Cosine 衰减
 
-            # 定期更新 Density Grid（warmup 后才开始）
-            if density_grid is not None and density_grid.should_update(step, grid_update_interval, grid_warmup_iters):
+            # 动态网格更新：前 10% 步数每 16 步更新，10%-50% 每 64 步，50% 后每 256 步
+            if step < train_iters * 0.1:
+                dynamic_interval = 16
+            elif step < train_iters * 0.5:
+                dynamic_interval = 64
+            else:
+                dynamic_interval = 256
+            
+            if density_grid is not None and density_grid.should_update(step, dynamic_interval, grid_warmup_iters):
                 model.eval()
                 active_ratio = density_grid.update(model, device=device, time=None)
                 model.train()
 
             # 日志输出和 TensorBoard 记录
             if step % log_every == 0:
-                psnr = compute_psnr(loss.item())
+                psnr = compute_psnr(loss_rgb.item())
                 skip_info = ""
                 if density_grid is not None:
                     skip_info = f" | Skip: {(1-active_ratio)*100:.1f}%"
@@ -557,8 +619,10 @@ def run_part2_instant(cfg, args):
                 )
                 
                 # 记录到 TensorBoard
-                tb_logger.log_scalar('Train/Loss', loss.item(), step)
+                tb_logger.log_scalar('Train/Loss', loss_rgb.item(), step)
                 tb_logger.log_scalar('Train/PSNR', psnr, step)
+                if use_tv_loss:
+                    tb_logger.log_scalar('Train/TV_Loss', loss_tv.item(), step)
                 if density_grid is not None:
                     tb_logger.log_scalar('Train/ActiveRatio', active_ratio, step)
             
@@ -937,6 +1001,7 @@ def run_part3(cfg, args):
         
         # C. 随机背景增强，每 batch 随机一个颜色
         use_random_bg = cfg.get('use_random_bg', False)
+        random_bg_start = cfg.get('random_bg_start', 0) if use_random_bg else float('inf')
         
         # D. 无监督一致性约束（体积守恒）
         use_unsup_consistency = cfg.get('use_unsupervised_consistency', False)
@@ -949,7 +1014,10 @@ def run_part3(cfg, args):
         if use_temporal_smooth:
             print(f">>> 正则化: 时间平滑已启用 (weight={temporal_smooth_weight:.0e}, ε={temporal_epsilon}, 消除时间抖动)")
         if use_random_bg:
-            print(f">>> 数据增强: 随机背景颜色已启用 (每 batch 随机 RGB)")
+            if random_bg_start > 0:
+                print(f">>> 数据增强: 随机背景增强 ({random_bg_start} 步后开启)")
+            else:
+                print(f">>> 数据增强: 随机背景增强 (全程启动)")
         if cfg.get('use_coord_noise', False):
             print(f">>> 数据增强: 坐标噪声已启用 (coord_std={cfg.get('coord_noise_std', 0.005)}, time_std={cfg.get('time_noise_std', 0.02)})")
         if use_unsup_consistency:
@@ -971,8 +1039,8 @@ def run_part3(cfg, args):
             target_alpha = target_rgba[:, 3:4] # [B, 1]
             
             # ======== B. 随机背景增强（学界标准做法）========
-            # 每个 batch 生成一个随机背景颜色，同时用于渲染和 target 合成
-            if use_random_bg:
+            # 从 random_bg_start 步开始启用随机背景增强
+            if use_random_bg and step >= random_bg_start:
                 bg_color = torch.rand(3, device=device)  # [3] 随机 RGB
             else:
                 bg_color = torch.ones(3, device=device) if white_bkgd else torch.zeros(3, device=device)
@@ -1081,12 +1149,12 @@ def run_part3(cfg, args):
             del extras
             
             # 性能优化：动态调整网格更新频率
-            # 前 1000 步：每 16 步更新（快速建立包络线）
-            # 1000-5000 步：每 64 步更新（中期优化）
-            # 5000 步后：每 256 步更新（后期微调）
-            if step < 1000:
+            # 前 10% 步数：每 16 步更新（快速建立包络线）
+            # 10%-50% 步数：每 64 步更新（中期优化）
+            # 50% 步数后：每 256 步更新（后期微调）
+            if step < train_iters * 0.1:
                 dynamic_interval = 16
-            elif step < 5000:
+            elif step < train_iters * 0.5:
                 dynamic_interval = 64
             else:
                 dynamic_interval = 256
@@ -1118,19 +1186,9 @@ def run_part3(cfg, args):
                 if density_grid is not None:
                     skip_info = f" | Skip: {(1-active_ratio)*100:.1f}%"
                 
-                # 构建附加损失信息字符串
-                aux_loss_info = ""
-                if use_tv_loss:
-                    aux_loss_info += f" | TV: {loss_tv_val:.2e}"
-                if use_temporal_smooth:
-                    aux_loss_info += f" | Temp: {loss_temporal_val:.2e}"
-                if use_unsup_consistency:
-                    aux_loss_info += f" | Unsup: {loss_unsup_val:.2e}"
-                
                 print(
                     f">>> Step {step}/{train_iters} | "
-                    f"RGB {loss_rgb_val:.6f} | "
-                    f"Reg {loss_reg_val:.9f}{aux_loss_info} | "
+                    f"Loss {total_loss_val:.6f} | "
                     f"PSNR {psnr:.2f} dB | "
                     f"LR {current_lr:.6f}{skip_info}"
                 )

@@ -97,7 +97,6 @@ class NeuralField(nn.Module):
             canonical_type = config.get('canonical_type', 'nerf') # 'nerf' or 'instant'
             if canonical_type == 'instant':
                 # 使用 Hash Grid 作为规范空间的表示
-                from .embeddings import HashRepresentation
                 self.canonical_repr = HashRepresentation(
                     n_levels=config.get('n_levels', 16),
                     n_features_per_level=config.get('n_features_per_level', 2),

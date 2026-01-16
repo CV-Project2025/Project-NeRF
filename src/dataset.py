@@ -58,16 +58,11 @@ class BlenderDataset:
                     Image.LANCZOS,
                 )
 
-            # 处理透明通道：alpha 合成到背景
+            # 处理透明通道：保留 RGBA 四通道用于随机背景增强
             img = np.array(img).astype(np.float32) / 255.0
-            rgb = img[..., :3]
-            alpha = img[..., 3:4]
-            if self.white_bkgd:
-                rgb = rgb * alpha + (1.0 - alpha)  # 白色背景
-            else:
-                rgb = rgb * alpha  # 黑色背景
+            rgba = img  # [H, W, 4] 保留完整的 RGBA
 
-            images.append(torch.from_numpy(rgb))
+            images.append(torch.from_numpy(rgba))
             poses.append(torch.tensor(frame["transform_matrix"], dtype=torch.float32))
 
         self.images = torch.stack(images, dim=0)
@@ -127,17 +122,26 @@ class BlenderDataset:
         return rays_o, rays_d
 
     def get_image_rays(self, index, device):
-        """获取指定图像的所有光线及目标颜色"""
+        """获取指定图像的所有光线及目标颜色（评估用，使用固定背景）"""
         c2w = self.poses[index]
         rays_o, rays_d = self.get_rays(c2w)
-        target = self.images[index]
+        
+        # 评估时使用预合成的 RGB（固定背景）
+        rgba = self.images[index]
+        rgb = rgba[..., :3]
+        alpha = rgba[..., 3:4]
+        if self.white_bkgd:
+            target = rgb * alpha + (1.0 - alpha)  # 白色背景
+        else:
+            target = rgb * alpha  # 黑色背景
+        
         return rays_o.to(device), rays_d.to(device), target.to(device)
 
     def sample_random_rays(self, batch_size, device):
         """
         随机采样光线用于训练
         
-        从所有图像中随机选择像素，返回对应的光线和目标颜色
+        从所有图像中随机选择像素，返回对应的光线和目标颜色(RGBA)
         """
         # 随机选择图像和像素位置
         img_idx = torch.randint(0, len(self), (batch_size,))
@@ -160,11 +164,11 @@ class BlenderDataset:
         if self.scene_scale != 1.0:
             rays_o = rays_o * self.scene_scale
 
-        # 获取对应像素的目标颜色
-        target = self.images[img_idx, pix_y, pix_x]
+        # 获取对应像素的目标颜色 (RGBA 4通道)
+        target_rgba = self.images[img_idx, pix_y, pix_x]  # [B, 4]
         rays_d = rays_d / torch.norm(rays_d, dim=-1, keepdim=True)
 
-        return rays_o.to(device), rays_d.to(device), target.to(device)
+        return rays_o.to(device), rays_d.to(device), target_rgba.to(device)
 
 
 class DynamicDataset(BlenderDataset):
