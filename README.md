@@ -12,6 +12,8 @@
 
 [milestone](https://latex.pku.edu.cn/project/6954fa6e57c9c512c3b063aa)
 
+[report](1)
+
 ---
 
 ## 2. 快速开始
@@ -35,7 +37,7 @@ pip install -r requirements.txt
 
 #### Instant-NeRF 依赖安装
 
-若要运行 **`Instant-NeRF`** ，请从 [网盘](https://disk.pku.edu.cn/link/AAF9F7FDBF0428495A933F2CAFB52E944B) 下载 `install_ngp.sh` 放置到项目文件夹运行一下，以确保所需的 TinyCUDA-NN 和相关组件正确安装。
+若要运行 **`Instant-NeRF`** ，请从 [网盘](https://disk.pku.edu.cn/anyshare/zh-cn/link/AAF9F7FDBF0428495A933F2CAFB52E944B/83161E9603DD440884AEA38F67B808E2/84035BCADD4346ED9A22D6EA1AD00CEF/671028B590AA46C7BD1E45E6F4C4B0AF?_tb=none) 下载 `install_ngp.sh` 放置到项目文件夹运行一下，以确保所需的 TinyCUDA-NN 和相关组件正确安装。
 
 #### 配置自定义
 
@@ -49,7 +51,6 @@ pip install -r requirements.txt
 **2. 训练**
 
 ```bash
-# 执行训练并拟合
 python3 run.py --image data/fox.jpg --config configs/part1.yaml
 ```
 
@@ -71,19 +72,17 @@ python3 run.py --image data/fox.jpg --config configs/part1.yaml --checkpoint <pa
 
 **1. 数据准备**
 
-建议下载 NeRF Synthetic 数据集，放置在 `data/nerf_synthetic/`下，可以从 [网盘/part2/data](https://disk.pku.edu.cn/link/AAF9F7FDBF0428495A933F2CAFB52E944B) 获取。
+建议下载 NeRF Synthetic 数据集，放置在 `data/nerf_synthetic/`下，可以从 [网盘/part2/data](https://disk.pku.edu.cn/anyshare/zh-cn/link/AAF9F7FDBF0428495A933F2CAFB52E944B/83161E9603DD440884AEA38F67B808E2/84035BCADD4346ED9A22D6EA1AD00CEF/671028B590AA46C7BD1E45E6F4C4B0AF/4D12B72493154D28819131CA3144D512/62BB1D321D0C4126889E8503E14E7FB7?_tb=none) 获取。
 
 **2. 训练**
 
 ```bash
-# 标准 NeRF 训练
 python3 run.py --data_dir data/nerf_synthetic/lego --config configs/part2.yaml
 ```
 
 **3. 测试**
 
 ```bash
-# 使用已有模型进行测试
 python3 run.py --data_dir data/nerf_synthetic/lego --config configs/part2.yaml \
   --checkpoint output/part2/checkpoints/model_step_020000.pth --eval_only
 ```
@@ -120,6 +119,31 @@ python3 run.py --data_dir data/nerf_synthetic/lego --config configs/part2_instan
 - 结果保存在 `output/part2_instant/`。
 - 使用 TensorBoard 监控损失下降与 PSNR 实时变化。
 - 训练和渲染速度较快，可根据需要调整 [配置](configs/part2_instant.yaml) 中 `batch_size` 和 `chunk` 参数以适配显存。
+
+### 2.5 Part 3: Dynamic NeRF (D-NeRF)
+
+**1. 数据准备**
+
+使用 D-NeRF 数据集，可从 [网盘/part3/data](https://disk.pku.edu.cn/anyshare/zh-cn/link/AAF9F7FDBF0428495A933F2CAFB52E944B/83161E9603DD440884AEA38F67B808E2/84035BCADD4346ED9A22D6EA1AD00CEF/671028B590AA46C7BD1E45E6F4C4B0AF/B9B86D05DF754D4B8A15C727136F93A0/4B4C851DDA53488CB79F8A943465ED6A?_tb=none) 获取并在 `data/` 下解压重命名为`d-nerf`。
+
+**2. 训练**
+
+```bash
+python3 run.py --data_dir data/d-nerf/standup --config configs/part3_instant.yaml
+```
+
+**3. 测试**
+
+```bash
+# --render_n 参数：-1表示生成视频，正数表示随机渲染指定数量的视角
+python3 run.py --data_dir data/d-nerf/standup --config configs/part3_instant.yaml \
+  --checkpoint output/part3/standup/best_model.pth --eval_only --render_n -1
+```
+
+**4. 输出说明**
+
+- 训练结果保存在 `output/part3/<dataset_name>`。
+- 支持类似于原始 NeRF 的训练，请使用对应的配置文件 `configs/part3.yaml.example`。
 
 ---
 
@@ -206,3 +230,45 @@ Project-NeRF/
 - **编码层**：`HashRepresentation` (TinyCUDA-NN 实现)。
 - **网络**：`InstantNeRFDecoder` (Tiny MLP)，通常只有 1-2 层隐含层，计算极快。
 - **流程**：Hash Encodings $\to$ Tiny MLP $\to$ RGB/$\sigma$。
+
+### Part 3: Dynamic NeRF
+
+**实验目标**：重建动态变化的 3D 场景（时间 $t$ 维度）。
+
+**核心原理**：
+
+1.  **变形场 (Deformation Field)**：
+    - 假设物体仅发生几何形变，将动态空间的坐标 $(x, t)$ 映射到规范空间 (Canonical Space) 的坐标 $x_c$。
+    - $$ x_c = x + \Delta x(x, t) $$
+    - $\Delta x$ 由一个变形网络预测。
+2.  **规范场 (Canonical NeRF)**：
+    - 在规范空间中训练一个静态的 NeRF 模型。
+    - 为了处理随时间变化的光影（非几何变化），规范网络的输入通常也会融合时间特征。
+
+**架构设计**：
+
+- **变形网络 (`DeformNet`)**：
+  - 输入：位置 $x$ (Fourier 编码) + 时间 $t$ (Fourier 编码)。
+  - 输出：位移向量 $\Delta x$。
+- **规范网络 (`CanonicalNet`)**：
+  - 输入：规范位置 $x_c = x + \Delta x$ (Fourier/Hash 编码) + 时间 $t$ + 观察方向 $d$。
+  - 输出：$RGB, \sigma$。
+
+**一些技术**：
+
+1.  **网络架构增强**：
+
+    - **时变规范特征**：将时间编码特征直接拼接到规范空间特征中，增强模型对随时间变化的光影（如移动高光、阴影）的建模能力。
+    - **混合架构**：结合 Instant-NGP HashGrid（规范场）与 MLP（变形场），在保持动态效果的同时大幅提升训练速度。
+
+2.  **数据增强**：
+
+    - **坐标噪声注入**：在训练时对变形网络的输入 $(x, t)$ 添加微小噪声 $(x \pm \epsilon)$，强制模型在邻域内输出相似位移，显著增强变形场的**空间平滑性**。
+    - **随机背景**：训练时随机切换背景颜色（黑/白/噪点），防止模型利用背景过拟合，提高抠图质量。
+    - **体积守恒约束**：对随机采样时刻的变形场施加约束，要求物体在不同时刻保持全局体积守恒，防止物体凭空膨胀或收缩。
+
+3.  **正则化**：
+
+    - **变形 L2 正则**：防止形变过大。
+    - **TV Loss**：平滑 HashGrid 特征。
+    - **时间平滑**：保证动作连贯。
