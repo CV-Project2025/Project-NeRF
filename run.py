@@ -2069,7 +2069,7 @@ def run_part4(cfg, args):
             torch.cuda.empty_cache()
 
     # =========================================================================
-    # 评估阶段（与 Part 3 相同的视频渲染逻辑）
+    # 评估阶段
     # =========================================================================
     import shutil
     import subprocess
@@ -2083,6 +2083,56 @@ def run_part4(cfg, args):
     model.eval()
     eval_bg_color = torch.ones(3, device=device) if white_bkgd else torch.zeros(3, device=device)
     
+    # eval_only 模式：只测试 PSNR，不生成视频
+    if args.eval_only:
+        print(f"\n>>> 评估模式：计算测试集 PSNR...")
+        psnrs = []
+        with torch.no_grad():
+            for idx in tqdm(range(len(test_set)), desc="Evaluating"):
+                rays_o, rays_d, target, time = test_set.get_image_rays(idx, device)
+                H, W = rays_o.shape[:2]
+                rays_o = rays_o.reshape(-1, 3)
+                rays_d = rays_d.reshape(-1, 3)
+                time = time.expand(H*W, 1)
+
+                pred_chunks = []
+                for i in range(0, rays_o.shape[0], chunk):
+                    pred_chunk, _, _, _ = render_rays(
+                        model=model,
+                        rays_o=rays_o[i:i+chunk],
+                        rays_d=rays_d[i:i+chunk],
+                        near=near,
+                        far=far,
+                        n_samples=render_n_samples,
+                        perturb=False,
+                        times=time[i:i+chunk],
+                        density_grid=density_grid,
+                        bg_color=eval_bg_color,
+                    )
+                    pred_chunks.append(pred_chunk)
+                
+                pred = torch.cat(pred_chunks, dim=0).reshape(H, W, 3)
+                pred = torch.clamp(pred, 0.0, 1.0)
+                psnr = compute_psnr_torch(pred, target)
+                psnrs.append(psnr)
+                
+                del pred, pred_chunks, rays_o, rays_d, target, time
+                torch.cuda.empty_cache()
+        
+        avg_psnr = float(np.mean(psnrs))
+        print(f"\n{'='*60}")
+        print(f">>> Part 4 测试集评估结果")
+        print(f">>> 平均 PSNR: {avg_psnr:.2f} dB ({len(psnrs)} 张图片)")
+        print(f"{'='*60}")
+        return
+    
+    # 训练模式结束后直接返回，不生成视频
+    if not args.eval_only:
+        print(f"\n>>> 训练完成！使用 --eval_only --render_n -1 来生成视频")
+        return
+    
+    # --eval_only + render_n != -1：渲染指定数量的测试集图片
+    # --eval_only + render_n == -1：生成环绕视频
     picture_dir = os.path.join(log_dir, "picture")
     os.makedirs(picture_dir, exist_ok=True)
     
