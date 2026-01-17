@@ -12,7 +12,7 @@
 
 [milestone](https://latex.pku.edu.cn/project/6954fa6e57c9c512c3b063aa)
 
-[report](1)
+[report](https://latex.pku.edu.cn/7474895241mkhtrdjqsctt#529d39)
 
 ---
 
@@ -122,6 +122,12 @@ python3 run.py --data_dir data/nerf_synthetic/lego --config configs/part2_instan
 
 ### 2.5 Part 3: Dynamic NeRF (D-NeRF)
 
+**Part 3 提供三种架构**：
+
+- **Part 3 标准版** (`part3.yaml`)：Fourier MLP 变形场 + Fourier MLP 规范场
+- **Part 3 DTC** (`part3_dtc.yaml`)：Direct Time Conditioning，无变形场，直接拼接时间编码
+- **Part 3 Instant** (`part3_instant.yaml`)：Fourier MLP 变形场 + Hash 规范场（推荐）
+
 **1. 数据准备**
 
 使用 D-NeRF 数据集，可从 [网盘/part3/data](https://disk.pku.edu.cn/anyshare/zh-cn/link/AAF9F7FDBF0428495A933F2CAFB52E944B/83161E9603DD440884AEA38F67B808E2/84035BCADD4346ED9A22D6EA1AD00CEF/671028B590AA46C7BD1E45E6F4C4B0AF/B9B86D05DF754D4B8A15C727136F93A0/4B4C851DDA53488CB79F8A943465ED6A?_tb=none) 获取并在 `data/` 下解压重命名为`d-nerf`。
@@ -129,7 +135,14 @@ python3 run.py --data_dir data/nerf_synthetic/lego --config configs/part2_instan
 **2. 训练**
 
 ```bash
+# 推荐：Instant 版本（速度最快，效果好）
 python3 run.py --data_dir data/d-nerf/standup --config configs/part3_instant.yaml
+
+# 标准版本（收敛慢，需要更长训练时间）
+python3 run.py --data_dir data/d-nerf/standup --config configs/part3.yaml
+
+# Direct Time Conditioning（实验性架构，适合动作简单的场景，几乎无法收敛）
+python3 run.py --data_dir data/d-nerf/standup --config configs/part3_dtc.yaml
 ```
 
 **3. 测试**
@@ -142,8 +155,47 @@ python3 run.py --data_dir data/d-nerf/standup --config configs/part3_instant.yam
 
 **4. 输出说明**
 
-- 训练结果保存在 `output/part3/<dataset_name>`。
-- 支持类似于原始 NeRF 的训练，请使用对应的配置文件 `configs/part3.yaml.example`。
+- 训练结果保存在 `output/part3/<dataset_name>`（标准/Instant）或 `output/part3_direct/<dataset_name>`（DTC）。
+- 生成的视频会保存为 `<dataset_name>_24fps.mp4`。
+- 支持环绕渲染（相机旋转 + 时间变化）。
+
+### 2.6 Part 4: Dual-Hash Dynamic NeRF
+
+**实验目标**：通过三网格时间锚点架构实现高质量动态场景重建。
+
+**核心创新**：
+
+- **Tri-Grid 时间锚点**：在 t=0, 0.5, 1 三个时刻使用独立 HashGrid，通过三角形加权插值实现 C1 连续
+- **TV-Displacement Loss**：对位移网格施加全变分正则化，消除物体边缘闪烁
+- **Static Anchor Loss**：强制 t=0 时零位移，确保规范空间有明确定义
+
+**1. 数据准备**
+
+使用与 Part 3 相同的 D-NeRF 数据集。
+
+**2. 训练**
+
+```bash
+python3 run.py --data_dir data/d-nerf/standup --config configs/part4.yaml
+```
+
+**3. 测试**
+
+```bash
+# 只测试 PSNR
+python3 run.py --data_dir data/d-nerf/standup --config configs/part4.yaml \
+  --checkpoint output/part4/standup/best_model.pth --eval_only
+
+# 生成环绕视频（300 帧）
+python3 run.py --data_dir data/d-nerf/standup --config configs/part4.yaml \
+  --checkpoint output/part4/standup/best_model.pth --eval_only --render_n -1
+```
+
+**4. 输出说明**
+
+- 训练结果保存在 `output/part4/<dataset_name>`。
+- 使用 `--eval_only` 模式会跳过视频渲染，仅输出测试集 PSNR。
+- 视频文件命名为 `<dataset_name>_part4_24fps.mp4`。
 
 ---
 
@@ -152,9 +204,13 @@ python3 run.py --data_dir data/d-nerf/standup --config configs/part3_instant.yam
 ```
 Project-NeRF/
 ├── configs/                # 实验配置文件
-│   ├── part1.yaml.example          # 2D 拟合配置模板
-│   ├── part2.yaml.example          # 标准 NeRF 配置模板
-│   └── part2_instant.yaml.example  # Instant-NGP 配置模板
+│   ├── part1.yaml.example              # 2D 拟合配置模板
+│   ├── part2.yaml.example              # 标准 NeRF 配置模板
+│   ├── part2_instant.yaml.example      # Instant-NGP 配置模板
+│   ├── part3.yaml.example              # Dynamic NeRF 标准版
+│   ├── part3_instant.yaml.example      # Dynamic NeRF Instant 版（推荐）
+│   ├── part3_dtc.yaml.example          # Dynamic NeRF Direct Time Conditioning
+│   └── part4.yaml.example              # Dual-Hash Dynamic NeRF
 ├── data/                   # 数据存放目录
 ├── output/                 # 实验输出 (日志, checkpionts, 渲染图)
 ├── src/                    # 核心代码
@@ -245,7 +301,7 @@ Project-NeRF/
     - 在规范空间中训练一个静态的 NeRF 模型。
     - 为了处理随时间变化的光影（非几何变化），规范网络的输入通常也会融合时间特征。
 
-**架构设计**：
+**架构设计（标准版 & Instant 版）**：
 
 - **变形网络 (`DeformNet`)**：
   - 输入：位置 $x$ (Fourier 编码) + 时间 $t$ (Fourier 编码)。
@@ -254,21 +310,84 @@ Project-NeRF/
   - 输入：规范位置 $x_c = x + \Delta x$ (Fourier/Hash 编码) + 时间 $t$ + 观察方向 $d$。
   - 输出：$RGB, \sigma$。
 
-**一些技术**：
+**架构设计（Direct Time Conditioning）**：
+
+- **无变形场**：直接将原始坐标 $x$、时间 $t$、方向 $d$ 的编码拼接输入 MLP
+- **单一解码器**：
+  - 输入：$[\text{embed}(x), \text{embed}(t), \text{embed}(d)]$
+  - 输出：$RGB, \sigma$
+- **优势**：架构简单，无需学习复杂的变形映射
+- **局限**：难以处理大幅度几何变形，适合简单周期性动作（如关节旋转）
+
+**技术创新**：
 
 1.  **网络架构增强**：
-
     - **时变规范特征**：将时间编码特征直接拼接到规范空间特征中，增强模型对随时间变化的光影（如移动高光、阴影）的建模能力。
     - **混合架构**：结合 Instant-NGP HashGrid（规范场）与 MLP（变形场），在保持动态效果的同时大幅提升训练速度。
 
 2.  **数据增强**：
-
     - **坐标噪声注入**：在训练时对变形网络的输入 $(x, t)$ 添加微小噪声 $(x \pm \epsilon)$，强制模型在邻域内输出相似位移，显著增强变形场的**空间平滑性**。
     - **随机背景**：训练时随机切换背景颜色（黑/白/噪点），防止模型利用背景过拟合，提高抠图质量。
     - **体积守恒约束**：对随机采样时刻的变形场施加约束，要求物体在不同时刻保持全局体积守恒，防止物体凭空膨胀或收缩。
 
 3.  **正则化**：
-
     - **变形 L2 正则**：防止形变过大。
     - **TV Loss**：平滑 HashGrid 特征。
     - **时间平滑**：保证动作连贯。
+
+### Part 4: Dual-Hash Dynamic NeRF
+
+**实验目标**：通过全哈希架构实现动态场景的高效高质量重建。
+
+**核心创新**：
+
+1.  **Tri-Grid 时间锚点 (Tri-Grid Temporal Anchoring)**：
+    - 使用三个独立的 HashGrid 分别记录 $t=0, 0.5, 1$ 时刻的位移场
+    - 通过**三角形加权插值**（而非分段线性）实现 C1 连续的时间插值
+    - 权重公式：$w_i = \max(0, 1 - |t - t_i| / 0.5)$，归一化后加权平均
+    - **解决问题**：消除视频中 t=1/6, 1/2, 5/6 附近的卡顿现象
+
+2.  **Dual-Hash 协同架构**：
+    - **位移场**：三个 HashGrid（`deform_grid_start/mid/end`）+ 轻量 MLP 解码器
+    - **规范场**：单个 HashGrid + Instant-NGP 解码器
+    - **优势**：位移场和规范场都使用哈希表，训练速度快，表达能力强
+
+3.  **TV-Displacement Loss**：
+    - 对位移哈希网格施加全变分正则化：$\mathcal{L}_{TV} = \sum |p_i - p_{i+1}|$
+    - **效果**：强制相邻哈希条目的位移向量相似，消除白色边缘闪烁和哈希碰撞噪点
+
+4.  **Static Anchor Loss**：
+    - 强制 $t=0$ 时刻 `deform_grid_start` 输出零位移
+    - **保证规范空间有明确定义**（第一帧 = 规范姿态）
+    - 消除底座抖动、避免规范空间漂移
+
+**架构设计**：
+
+- **时间编码 → 时间调制网络**：
+  - 输入：时间 $t$ 的 Fourier 编码
+  - 输出：时间调制向量（用于控制位移强度）
+  - 设计：2 层轻量 MLP + Sigmoid 门控
+
+- **三网格位移解码**：
+  - 输入：空间坐标 $x$ → 三个 HashGrid 查询 → 插值融合 + 时间调制
+  - 输出：位移向量 $\Delta x$
+
+- **规范场渲染**：
+  - 输入：规范位置 $x_c = x + \Delta x$ → HashGrid 编码 + 时间特征 + 方向
+  - 输出：$RGB, \sigma$
+
+**正则化策略**：
+
+| 正则项          | 权重     | 作用                             |
+| --------------- | -------- | -------------------------------- |
+| TV-Displacement | 0.0001   | 消除位移网格的高频噪声和边缘闪烁 |
+| TV-Canonical    | 0.000001 | 平滑规范空间哈希特征             |
+| Deformation L2  | 0.0001   | 限制位移幅度，防止几何扭曲       |
+| Temporal Smooth | 0.0001   | 强制相邻时刻位移连续             |
+| Static Anchor   | 0.001    | t=0 时零位移约束                 |
+
+**性能对比**：
+
+- **训练速度**：比 Part 3 标准版快 5-10 倍
+- **渲染质量**：与 Part 3 Instant 相当或更优（取决于正则化调优）
+- **视频流畅度**：三角形插值显著改善时间连续性
