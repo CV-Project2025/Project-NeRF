@@ -1,0 +1,87 @@
+# ==============================================================================
+# Part 4: Dual-Hash Dynamic NeRF 配置
+# ==============================================================================
+mode: part4
+
+# 数据集
+downscale: 2
+white_bkgd: true
+scene_scale: 1.0
+
+# 体渲染
+near: 2.0
+far: 6.0
+n_samples: 64
+render_n_samples: 128
+batch_size: 8192
+chunk: 10000
+
+# 优化器
+train_iters: 10000
+learning_rate: 0.01
+weight_decay: 0.00001
+eta_min: 0.0001
+max_grad_norm: 1.0
+use_amp: true
+log_every: 50
+val_every: 500
+
+# 正则化
+use_tv_displacement: true
+tv_displacement_weight: 0.0001 # 位移场 TV 正则
+tv_loss_weight: 0.000001 # 规范空间 TV 正则
+deformation_reg_weight: 0.0001 # 位移向量 L2 正则
+use_temporal_smooth: true
+temporal_smooth_weight: 0.0001
+temporal_epsilon: 0.02
+temporal_n_samples: 256
+use_static_anchor: true # t=0 锚点约束
+static_anchor_weight: 0.001
+static_anchor_n_samples: 512
+
+# 数据增强
+use_coord_noise: true
+coord_noise_std: 0.001
+time_noise_std: 0.01
+use_random_bg: true
+random_bg_start: 1000
+use_unsupervised_consistency: true
+unsup_consistency_weight: 0.001
+unsup_n_samples: 512
+
+# 位移哈希网格
+deform_n_levels: 12
+deform_n_features_per_level: 2
+deform_log2_hashmap_size: 18
+deform_base_resolution: 16
+deform_per_level_scale: 1.5
+deform_hidden_dim: 64
+
+# 时间调制网络
+L_embed_time: 10
+time_modulation_dim: 64
+time_modulation_layers: 2
+
+# 规范空间哈希网格
+n_levels: 16
+n_features_per_level: 2
+log2_hashmap_size: 20
+base_resolution: 16
+per_level_scale: 1.5
+scene_bound: 1.5
+hidden_dim: 64
+
+# 密度网格加速
+use_density_grid: true
+grid_resolution: 128
+grid_threshold: 0.01
+grid_warmup_iters: 256
+grid_stop_ratio: 0.9
+
+# 输出与渲染
+log_dir: "output/part4"
+video_frames: 300
+n_rotations: 1.5
+scene_center: [0.0, 0.0, 0.0]
+camera_height: 2.4
+camera_radius: 3.0

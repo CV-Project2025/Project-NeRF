@@ -228,13 +228,13 @@ class DirectTimeDecoder(BaseDecoder):
                 if i == skip_layer:
                     in_dim += input_dim  # Skip connection
             
-            out_dim = hidden_dim if i < num_layers - 1 else output_dim
-            layers.append(nn.Linear(in_dim, out_dim))
-            if i < num_layers - 1:
-                layers.append(nn.ReLU())
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            layers.append(nn.ReLU())
         
-        self.net = nn.Sequential(*layers)
-
+        # 输出层
+        layers.append(nn.Linear(hidden_dim, output_dim))
+        self.net = nn.ModuleList(layers)
+    
     def forward(self, x_enc, t_enc, d_enc):
         """
         Args:
@@ -259,3 +259,114 @@ class DirectTimeDecoder(BaseDecoder):
         rgb = torch.sigmoid(h[..., :3])  # [N, 3]
         sigma = F.relu(h[..., 3:4])      # [N, 1]
         return rgb, sigma
+
+
+class HashDeformationDecoder(BaseDecoder):
+    """
+    哈希位移解码器
+
+    将哈希网格特征解码为 3D 位移向量 Δx。
+    
+    核心设计
+    - 乘法门控：时间调制通过 element-wise 乘法作用于空间特征
+    - 零偏置锚定：t=0 时调制因子接近 0，确保规范空间无变形
+    - 极小初始化：displacement_scale 初始值极小，防止训练初期位移过大
+    """
+    def __init__(self, 
+                 hash_dim,           # 位移哈希网格特征维度
+                 time_mod_dim,       # 时间调制向量维度
+                 hidden_dim=64):     # 隐藏层维度
+        super().__init__()
+        
+        import tinycudann as tcnn
+        
+        # 位移解码器：哈希特征 + 时间调制 → Δx
+        # 使用 2 层 MLP 保持轻量
+        self.deform_net = tcnn.Network(
+            n_input_dims=hash_dim + time_mod_dim,
+            n_output_dims=3,  # (dx, dy, dz)
+            network_config={
+                "otype": "FullyFusedMLP",
+                "activation": "ReLU",
+                "output_activation": "None",  # 位移可正可负
+                "n_neurons": hidden_dim,
+                "n_hidden_layers": 2,
+            }
+        )
+        
+        # 位移缩放因子：初始值 0.1，允许位移场正常学习（过小会导致位移被压制，过大会导致不稳定）
+        self.displacement_scale = nn.Parameter(torch.tensor(0.1))
+    
+    def forward(self, hash_feat, time_mod):
+        """
+        Args:
+            hash_feat: [N, hash_dim] 位移哈希网格特征
+            time_mod: [N, time_mod_dim] 时间调制向量
+        
+        Returns:
+            delta_x: [N, 3] 位移向量
+        """
+        # 拼接哈希特征和时间调制
+        h = torch.cat([hash_feat, time_mod], dim=-1)
+        
+        # 解码为位移
+        delta_x = self.deform_net(h)  # [N, 3]
+        
+        # 应用缩放因子
+        delta_x = delta_x * self.displacement_scale
+        
+        return delta_x
+
+
+class TimeModulationNetwork(BaseDecoder):
+    """
+    时间调制网络
+    
+    将时间编码映射为调制向量，用于控制位移哈希网格的输出。
+    实现时空解耦：空间由 HashGrid 处理，时间由轻量 MLP 处理。
+    
+    核心设计（零偏置锚定）：
+    - 输入：时间的 Fourier 编码
+    - 输出：时间调制向量（用于调制位移场）
+    - t=0 时输出接近零（规范空间无变形）
+    - 使用 sigmoid 门控确保输出在 [0, 1] 范围，再中心化到 [-1, 1]
+    """
+    def __init__(self, 
+                 time_dim,           # 时间编码维度
+                 output_dim=64,      # 输出调制向量维度
+                 hidden_dim=64,      # 隐藏层维度
+                 num_layers=2):      # 网络层数
+        super().__init__()
+        self.output_dim = output_dim
+        
+        layers = []
+        in_dim = time_dim
+        
+        for i in range(num_layers):
+            out_dim = hidden_dim if i < num_layers - 1 else output_dim
+            layers.append(nn.Linear(in_dim, out_dim))
+            if i < num_layers - 1:
+                layers.append(nn.ReLU())
+            in_dim = out_dim
+        
+        self.net = nn.Sequential(*layers)
+        
+        # 初始化策略：
+        # 1. 最后一层权重正常初始化，保证不同时刻有不同输出
+        # 2. 偏置初始化为 -1.0，这样 sigmoid(output) 初期偏小
+        # 3. 训练时网络会学习到正确的时间调制
+        nn.init.xavier_uniform_(layers[-1].weight)  # 正常初始化，保证时间敏感性
+        nn.init.constant_(layers[-1].bias, -1.0)    # sigmoid(-1) ≈ 0.27，初期偏小
+    
+    def forward(self, time_feat):
+        """
+        Args:
+            time_feat: [N, time_dim] 时间编码
+        
+        Returns:
+            time_mod: [N, output_dim] 时间调制向量，范围约 [0, 1]
+        """
+        raw = self.net(time_feat)
+        # 使用 sigmoid 门控，确保 t=0 时调制因子接近 0，这样当 t=0 时，位移会被压制到接近零
+        return torch.sigmoid(raw)
+

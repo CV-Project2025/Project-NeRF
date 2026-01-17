@@ -36,7 +36,7 @@ class DensityGrid(nn.Module):
     def update(self, model, n_samples=128**3, device='cuda', time=None, decay=1.0):
         """
         更新占据网格：通过询问 model 各点的密度值，更新 grid 和 binary_grid
-        part 3 时空并集更新：保留历史轨迹，取最大值
+        Part 4 三锚点更新：在 t=0, 0.5, 1 三个时刻采样并取最大值
         
         Args:
             model: NeRF 模型
@@ -55,41 +55,71 @@ class DensityGrid(nn.Module):
         
         # 分批查询密度（避免显存溢出）
         batch_size = 2**18  # 256K 点一批
-        density_values = []
         
-        # 检测模型是否为 Part 3 动态模型
+        # 检测模型是否为 Part 3/4 动态模型
         mode = getattr(model, 'mode', 'unknown')
         
-        for i in range(0, pts.shape[0], batch_size):
-            batch_pts = pts[i:i + batch_size]
+        # Part 4 三锚点密度采样
+        # 在 t=0, 0.5, 1 三个锚点时刻分别采样密度并取最大值
+        # 确保 Density Grid 覆盖物体的完整运动轨迹
+        if mode == 'part4':
+            anchor_times = [0.0, 0.5, 1.0]  # 三个锚点时刻（与插值锚点一致）
+            all_anchor_densities = []
             
-            # 使用零方向（密度与方向无关）
-            dummy_dirs = torch.zeros_like(batch_pts)
+            for t_anchor in anchor_times:
+                density_values = []
+                t_tensor = torch.tensor([[t_anchor]], device=device)
+                
+                for i in range(0, pts.shape[0], batch_size):
+                    batch_pts = pts[i:i + batch_size]
+                    dummy_dirs = torch.zeros_like(batch_pts)
+                    time_batch = t_tensor.expand(batch_pts.shape[0], -1)
+                    
+                    with torch.no_grad():
+                        _, sigma, _ = model(batch_pts, dummy_dirs, t=time_batch)
+                    density_values.append(sigma.squeeze(-1))
+                
+                anchor_density = torch.cat(density_values, dim=0)
+                all_anchor_densities.append(anchor_density)
             
-            # 查询模型密度
-            with torch.no_grad():
-                if mode == 'part3':
-                    # 动态模型：使用数据集中间时刻的真实时间戳构建网格
-                    if time is None:
-                        raise ValueError("Part 3 density grid update requires a time parameter from dataset")
-                    time_batch = time.expand(batch_pts.shape[0], -1)
-                    _, sigma, _ = model(batch_pts, dummy_dirs, t=time_batch)
-                else:
-                    # 静态模型
-                    _, sigma = model(batch_pts, dummy_dirs)
-            
-            density_values.append(sigma.squeeze(-1))
+            # 取三个锚点时刻的最大密度
+            all_densities = torch.stack(all_anchor_densities, dim=0).max(dim=0)[0]
         
-        # 拼接所有密度值
-        all_densities = torch.cat(density_values, dim=0)  # [resolution³]
+        elif mode == 'part3':
+            # Part 3：使用传入的时间参数
+            density_values = []
+            if time is None:
+                raise ValueError("Part 3 density grid update requires a time parameter")
+            
+            for i in range(0, pts.shape[0], batch_size):
+                batch_pts = pts[i:i + batch_size]
+                dummy_dirs = torch.zeros_like(batch_pts)
+                time_batch = time.expand(batch_pts.shape[0], -1)
+                
+                with torch.no_grad():
+                    _, sigma, _ = model(batch_pts, dummy_dirs, t=time_batch)
+                density_values.append(sigma.squeeze(-1))
+            
+            all_densities = torch.cat(density_values, dim=0)
+        
+        else:
+            # 静态模型
+            density_values = []
+            for i in range(0, pts.shape[0], batch_size):
+                batch_pts = pts[i:i + batch_size]
+                dummy_dirs = torch.zeros_like(batch_pts)
+                
+                with torch.no_grad():
+                    _, sigma = model(batch_pts, dummy_dirs)
+                density_values.append(sigma.squeeze(-1))
+            
+            all_densities = torch.cat(density_values, dim=0)
         
         # 重塑为 3D 网格（当前时刻）
         current_grid = all_densities.reshape(self.resolution, self.resolution, self.resolution)
         
-        # 严格时空并集 - 只要过去有或现在有，就标为活跃，确保网格覆盖整个运动轨迹
-        mode = getattr(model, 'mode', 'unknown')
-        if mode == 'part3':
-            # 保留历史 + 当前时刻取最大值
+        # 时空并集 - 保留历史最大值
+        if mode in ['part3', 'part4']:
             self.grid = torch.maximum(self.grid * decay, current_grid)
         else:
             self.grid = current_grid
@@ -246,7 +276,7 @@ def render_rays(
             bg_color = torch.zeros(3, device=device)  # 黑色
 
     # 兼容性检查与时间处理
-    if mode == "part3":
+    if mode in ["part3", "part4"]:
         if times is None:
             # 如果是动态模式但未提供时间，默认使用 t=0
             times = torch.zeros((n_rays, 1), device=device)
@@ -281,7 +311,7 @@ def render_rays(
             active_mask[0] = True
         
         # 查询活跃点
-        if mode == "part3":
+        if mode in ["part3", "part4"]:
             rgb_compact, sigma_compact, delta_x_compact = model(
                 pts_flat[active_mask],
                 view_dirs_flat[active_mask],
@@ -303,7 +333,7 @@ def render_rays(
         sigma[active_mask] = sigma_compact.float()
         
         # 处理变形量
-        if mode == "part3" and delta_x_compact is not None:
+        if mode in ["part3", "part4"] and delta_x_compact is not None:
             delta_x_flat = delta_x_compact.new_zeros(pts_flat.shape[0], 3, dtype=torch.float32)
             delta_x_flat[active_mask] = delta_x_compact.float()
         else:
@@ -314,7 +344,7 @@ def render_rays(
 
     else:
         # 标准路径 (适用于所有模式)
-        if mode == "part3":
+        if mode in ["part3", "part4"]:
             # 动态模式: 调用带时间参数的模型
             rgb_flat, sigma_flat, delta_x_flat = model(pts_flat, view_dirs_flat, t=times_flat)
         # 标准 NeRF: 查询所有点
@@ -332,7 +362,7 @@ def render_rays(
     # 动态返回值：根据是否提供 times 参数决定返回格式，保持向后兼容
     if times is not None:
         extras = {}
-        if mode == "part3" and delta_x_flat is not None:
+        if mode in ["part3", "part4"] and delta_x_flat is not None:
             # 从 volume_render 复用逻辑计算 weights
             dists = z_vals[:, 1:] - z_vals[:, :-1]
             dists = torch.cat([dists, torch.full_like(dists[:, :1], 1e10)], dim=-1)

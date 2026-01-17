@@ -1,7 +1,10 @@
 import torch
 import torch.nn as nn
 from .embeddings import FourierRepresentation, HashRepresentation
-from .decoders import StandardMLP, NeRFDecoder, InstantNeRFDecoder, DeformationNetwork
+from .decoders import (
+    StandardMLP, NeRFDecoder, InstantNeRFDecoder, DeformationNetwork,
+    HashDeformationDecoder, TimeModulationNetwork
+)
 
 class NeuralField(nn.Module):
     """神经场模型：坐标 → 编码 → 解码 → 输出"""
@@ -72,6 +75,7 @@ class NeuralField(nn.Module):
                 dir_dim=self.dir_representation.out_dim,
                 hidden_dim=config.get('hidden_dim', 64)
             )
+        # part3: Dynamic NeRF 
         elif self.mode == 'part3':
             # 方向编码
             L_dir = config.get('L_embed_dir', 4)
@@ -124,6 +128,85 @@ class NeuralField(nn.Module):
                     skip_layer=config.get('skip_layer', 4),
                     view_dim=config.get('view_dim', 128),
                 )
+        # Part 4: Dual-Hash Dynamic NeRF 
+        elif self.mode == 'part4':
+            # 方向编码（与 Part 3 相同）
+            L_dir = config.get('L_embed_dir', 4)
+            self.dir_representation = FourierRepresentation(
+                input_dim=3, L=L_dir, use_encoding=True
+            )
+            
+            # 时间编码 
+            L_time = config.get('L_embed_time', 10)
+            self.time_encoder = FourierRepresentation(
+                input_dim=1, L=L_time, use_encoding=True
+            )
+            
+            # 时间调制网络（轻量 MLP）
+            # 将时间编码映射为调制向量，用于控制位移哈希网格
+            time_mod_dim = config.get('time_modulation_dim', 64)
+            time_mod_layers = config.get('time_modulation_layers', 2)
+            self.time_modulation = TimeModulationNetwork(
+                time_dim=self.time_encoder.out_dim,
+                output_dim=time_mod_dim,
+                hidden_dim=time_mod_dim,
+                num_layers=time_mod_layers
+            )
+            
+            # ==============================================================
+            # 三网格时间锚点
+            # 用三个独立的 HashGrid 分别记录 t=1/6, t=1/2, t=5/6 时刻的位移场
+            # 通过线性插值实现时间连续的位移表达
+            # ==============================================================
+            deform_grid_config = {
+                'n_levels': config.get('deform_n_levels', 14),
+                'n_features_per_level': config.get('deform_n_features_per_level', 2),
+                'log2_hashmap_size': config.get('deform_log2_hashmap_size', 19),
+                'base_resolution': config.get('deform_base_resolution', 16),
+                'per_level_scale': config.get('deform_per_level_scale', 1.5),
+                'bound': config.get('scene_bound', 1.5)
+            }
+            
+            # 三个时间锚点的位移网格
+            self.deform_grid_start = HashRepresentation(**deform_grid_config)  # t=1/6
+            self.deform_grid_mid = HashRepresentation(**deform_grid_config)    # t=1/2
+            self.deform_grid_end = HashRepresentation(**deform_grid_config)    # t=5/6
+            
+            # 手动扰动 mid 和 end 网格的参数，处理初始化相同的问题
+            with torch.no_grad():
+                noise_mid = torch.randn_like(self.deform_grid_mid.encoding.params) * 1e-4
+                self.deform_grid_mid.encoding.params.add_(noise_mid)
+                noise_end = torch.randn_like(self.deform_grid_end.encoding.params) * 1e-4
+                self.deform_grid_end.encoding.params.add_(noise_end)
+            
+            # 兼容旧代码：保留 deformation_grid 引用（指向 start）
+            self.deformation_grid = self.deform_grid_start
+            
+            # 位移解码器（三个网格共享）
+            # 将哈希特征 + 时间调制解码为位移向量
+            self.deform_decoder = HashDeformationDecoder(
+                hash_dim=self.deform_grid_start.out_dim,
+                time_mod_dim=time_mod_dim,
+                hidden_dim=config.get('deform_hidden_dim', 64)
+            )
+            
+            # 规范空间哈希网格（与 Part 3 Instant 相同）
+            self.canonical_repr = HashRepresentation(
+                n_levels=config.get('n_levels', 16),
+                n_features_per_level=config.get('n_features_per_level', 2),
+                log2_hashmap_size=config.get('log2_hashmap_size', 19),
+                base_resolution=config.get('base_resolution', 16),
+                per_level_scale=config.get('per_level_scale', 1.5),
+                bound=config.get('scene_bound', 1.5)
+            )
+            
+            # 规范空间解码器 
+            # 输入：规范空间哈希特征 + 时间编码
+            self.decoder = InstantNeRFDecoder(
+                pos_dim=self.canonical_repr.out_dim + self.time_encoder.out_dim,
+                dir_dim=self.dir_representation.out_dim,
+                hidden_dim=config.get('hidden_dim', 64)
+            )
 
             self.direct_time_conditioning = config.get('direct_time_conditioning', False)
             if self.direct_time_conditioning:
@@ -144,7 +227,7 @@ class NeuralField(nn.Module):
         """
         x: 位置坐标 [N, 2/3]
         d: 视角方向 [N, 3] (仅 part2_nerf/part2_instant)
-        t: 时间戳 [N, 1] (仅 part3)
+        t: 时间戳 [N, 1] (仅 part3/part4)
         """
         if self.mode == "part3":
             if t is None:
@@ -162,7 +245,7 @@ class NeuralField(nn.Module):
                 delta_x = torch.zeros_like(x)
                 return rgb, sigma, delta_x
 
-            # ======== A. 坐标噪声增强 ========
+            # 坐标噪声增强 
             # 在训练阶段给 DeformNet 的输入注入微小噪声
             # 强制模型在 x±ε 范围内输出相似位移，增强变形场平滑性
             x_deform = x
@@ -192,6 +275,78 @@ class NeuralField(nn.Module):
             h_combined = torch.cat([feat_can, feat_t], dim=-1)
             rgb, sigma = self.decoder(h_combined, feat_d)     # CanonicalNet(feat_combined, feat_d)
 
+            # 返回 rgb, sigma, Δx
+            return rgb, sigma, delta_x
+        
+        elif self.mode == "part4":
+            if t is None:
+                raise ValueError("Part 4 requires time input 't'.")
+            
+            # 坐标噪声增强（与 Part 3 相同）
+            x_deform = x
+            t_deform = t
+            if self.training and self.use_coord_noise:
+                if self.coord_noise_std > 0:
+                    x_deform = x + torch.randn_like(x) * self.coord_noise_std
+                if self.time_noise_std > 0:
+                    t_deform = t + torch.randn_like(t) * self.time_noise_std
+                    t_deform = torch.clamp(t_deform, 0.0, 1.0)
+            
+            # 时间编码与调制
+            feat_t = self.time_encoder(t_deform)          # embed(t')
+            time_mod = self.time_modulation(feat_t)       # 时间调制向量
+            
+            # ==============================================================
+            # 三网格时间锚点插值 (Tri-Grid Temporal Interpolation)
+            # 使用三角形加权（C1连续），消除分段边界的卡顿
+            # 锚点布局: Grid_start @ t=0, Grid_mid @ t=0.5, Grid_end @ t=1
+            # 加权策略: 每个网格的权重随距离锚点的远近平滑衰减
+            # ==============================================================
+            
+            # 查询三个网格的特征
+            feat_start = self.deform_grid_start(x_deform)  # [N, hash_dim]
+            feat_mid = self.deform_grid_mid(x_deform)      # [N, hash_dim]
+            feat_end = self.deform_grid_end(x_deform)      # [N, hash_dim]
+            
+            # 锚点位置：均匀分布在 0, 0.5, 1
+            T_START = 0.0
+            T_MID = 0.5
+            T_END = 1.0
+            
+            t_val = t_deform  # [N, 1]
+            
+            # 三角形加权：每个锚点的权重在其位置最大(=1)，向两侧线性衰减
+            # 权重公式: w = max(0, 1 - |t - anchor| / bandwidth)
+            # bandwidth = 0.5 确保相邻锚点权重平滑过渡
+            bandwidth = 0.5
+            
+            w_start = torch.clamp(1.0 - torch.abs(t_val - T_START) / bandwidth, 0.0, 1.0)
+            w_mid = torch.clamp(1.0 - torch.abs(t_val - T_MID) / bandwidth, 0.0, 1.0)
+            w_end = torch.clamp(1.0 - torch.abs(t_val - T_END) / bandwidth, 0.0, 1.0)
+            
+            # 归一化权重（确保 w_start + w_mid + w_end = 1）
+            w_sum = w_start + w_mid + w_end + 1e-8  # 避免除零
+            w_start = w_start / w_sum
+            w_mid = w_mid / w_sum
+            w_end = w_end / w_sum
+            
+            # 加权插值（全程 C1 连续）
+            deform_feat = w_start * feat_start + w_mid * feat_mid + w_end * feat_end
+            
+            # 位移解码：插值后的哈希特征 + 时间调制 → Δx
+            delta_x = self.deform_decoder(deform_feat, time_mod)  # [N, 3]
+            
+            # 计算规范空间坐标
+            x_canonical = x + delta_x  # 使用原始 x（与 Part 3 一致）
+            
+            # 规范空间渲染（与 Part 3 Instant 相同）
+            feat_can = self.canonical_repr(x_canonical)   # 规范空间哈希编码
+            feat_d = self.dir_representation(d)           # 方向编码
+            
+            # 将时间特征拼接到规范空间特征
+            h_combined = torch.cat([feat_can, feat_t], dim=-1)
+            rgb, sigma = self.decoder(h_combined, feat_d)
+            
             # 返回 rgb, sigma, Δx
             return rgb, sigma, delta_x
 
