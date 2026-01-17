@@ -271,50 +271,40 @@ class NeuralField(nn.Module):
             
             # ==============================================================
             # 三网格时间锚点插值 (Tri-Grid Temporal Interpolation)
-            # 锚点布局: Grid_start @ t=1/6, Grid_mid @ t=1/2, Grid_end @ t=5/6
-            # 分段策略：
-            #   [0, 1/6]:      纯 Grid_start
-            #   (1/6, 1/2]:    LERP(Grid_start, Grid_mid)
-            #   (1/2, 5/6]:    LERP(Grid_mid, Grid_end)
-            #   (5/6, 1]:      纯 Grid_end
+            # 使用三角形加权（C1连续），消除分段边界的卡顿
+            # 锚点布局: Grid_start @ t=0, Grid_mid @ t=0.5, Grid_end @ t=1
+            # 加权策略: 每个网格的权重随距离锚点的远近平滑衰减
             # ==============================================================
             
             # 查询三个网格的特征
-            feat_start = self.deform_grid_start(x_deform)  # [N, hash_dim] - 锚定 t=1/6
-            feat_mid = self.deform_grid_mid(x_deform)      # [N, hash_dim] - 锚定 t=1/2
-            feat_end = self.deform_grid_end(x_deform)      # [N, hash_dim] - 锚定 t=5/6
+            feat_start = self.deform_grid_start(x_deform)  # [N, hash_dim]
+            feat_mid = self.deform_grid_mid(x_deform)      # [N, hash_dim]
+            feat_end = self.deform_grid_end(x_deform)      # [N, hash_dim]
             
-            # 时间锚点位置
-            T_START = 1.0 / 6.0   # 0.1667
-            T_MID = 0.5           # 0.5
-            T_END = 5.0 / 6.0     # 0.8333
+            # 锚点位置：均匀分布在 0, 0.5, 1
+            T_START = 0.0
+            T_MID = 0.5
+            T_END = 1.0
             
             t_val = t_deform  # [N, 1]
             
-            # 计算插值权重
-            alpha_1 = (t_val - T_START) / (T_MID - T_START)  # (1/6, 1/2] → (0, 1]
-            alpha_2 = (t_val - T_MID) / (T_END - T_MID)      # (1/2, 5/6] → (0, 1]
+            # 三角形加权：每个锚点的权重在其位置最大(=1)，向两侧线性衰减
+            # 权重公式: w = max(0, 1 - |t - anchor| / bandwidth)
+            # bandwidth = 0.5 确保相邻锚点权重平滑过渡
+            bandwidth = 0.5
             
-            # Clamp 到 [0, 1]
-            alpha_1 = torch.clamp(alpha_1, 0.0, 1.0)
-            alpha_2 = torch.clamp(alpha_2, 0.0, 1.0)
+            w_start = torch.clamp(1.0 - torch.abs(t_val - T_START) / bandwidth, 0.0, 1.0)
+            w_mid = torch.clamp(1.0 - torch.abs(t_val - T_MID) / bandwidth, 0.0, 1.0)
+            w_end = torch.clamp(1.0 - torch.abs(t_val - T_END) / bandwidth, 0.0, 1.0)
             
-            feat_seg1 = feat_start  # [0, 1/6]
-            feat_seg2 = (1 - alpha_1) * feat_start + alpha_1 * feat_mid  # (1/6, 1/2]
-            feat_seg3 = (1 - alpha_2) * feat_mid + alpha_2 * feat_end    # (1/2, 5/6]
-            feat_seg4 = feat_end  # (5/6, 1]
+            # 归一化权重（确保 w_start + w_mid + w_end = 1）
+            w_sum = w_start + w_mid + w_end + 1e-8  # 避免除零
+            w_start = w_start / w_sum
+            w_mid = w_mid / w_sum
+            w_end = w_end / w_sum
             
-            # 使用 where 选择正确的段
-            deform_feat = torch.where(
-                t_val <= T_START, feat_seg1,
-                torch.where(
-                    t_val <= T_MID, feat_seg2,
-                    torch.where(
-                        t_val <= T_END, feat_seg3,
-                        feat_seg4
-                    )
-                )
-            )  # [N, hash_dim]
+            # 加权插值（全程 C1 连续）
+            deform_feat = w_start * feat_start + w_mid * feat_mid + w_end * feat_end
             
             # 位移解码：插值后的哈希特征 + 时间调制 → Δx
             delta_x = self.deform_decoder(deform_feat, time_mod)  # [N, 3]
