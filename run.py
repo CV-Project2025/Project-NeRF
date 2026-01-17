@@ -18,6 +18,15 @@ from src.renderer import render_image, render_rays
 from src.utils import compute_psnr, compute_psnr_torch, render_image_safe, TensorBoardLogger, get_exp_name
 
 
+def create_grad_scaler(use_amp):
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        try:
+            return torch.amp.GradScaler(device_type="cuda", enabled=use_amp)
+        except TypeError:
+            return torch.amp.GradScaler(enabled=use_amp)
+    return torch.cuda.amp.GradScaler(enabled=use_amp)
+
+
 def run_part1(cfg, args):
     """Part 1: 2D 图像拟合"""
 
@@ -1012,7 +1021,7 @@ def run_part3(cfg, args):
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=train_iters, eta_min=eta_min)
         
         use_amp = cfg.get('use_amp', True)
-        scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+        scaler = create_grad_scaler(use_amp)
         
         loss_fn = nn.MSELoss()
         print(">>> 开始训练 Part 3 (Dynamic NeRF)...")
@@ -1732,7 +1741,7 @@ def run_part4(cfg, args):
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=train_iters, eta_min=eta_min)
         
         use_amp = cfg.get('use_amp', True)
-        scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+        scaler = create_grad_scaler(use_amp)
         
         loss_fn = nn.MSELoss()
         
