@@ -128,6 +128,22 @@ class NeuralField(nn.Module):
                     skip_layer=config.get('skip_layer', 4),
                     view_dim=config.get('view_dim', 128),
                 )
+            
+            # Direct Time Conditioning（可选，用于消融实验）
+            self.direct_time_conditioning = config.get('direct_time_conditioning', False)
+            if self.direct_time_conditioning:
+                # 使用 Fourier 编码原始位置 (x)
+                L_pos = config.get('L_embed', 10)
+                self.pos_encoder_direct = FourierRepresentation(input_dim=3, L=L_pos, use_encoding=True)
+                # 解码器：输入 = [pos_enc(x), time_enc(t), dir_enc(d)]
+                self.decoder_direct = NeRFDecoder(
+                    pos_dim=self.pos_encoder_direct.out_dim + self.time_encoder.out_dim,
+                    dir_dim=self.dir_representation.out_dim,
+                    hidden_dim=config.get('hidden_dim', 256),
+                    num_layers=config.get('num_layers', 8),
+                    skip_layer=config.get('skip_layer', 4),
+                    view_dim=config.get('view_dim', 128),
+                )
         # Part 4: Dual-Hash Dynamic NeRF 
         elif self.mode == 'part4':
             # 方向编码（与 Part 3 相同）
@@ -207,21 +223,6 @@ class NeuralField(nn.Module):
                 dir_dim=self.dir_representation.out_dim,
                 hidden_dim=config.get('hidden_dim', 64)
             )
-
-            self.direct_time_conditioning = config.get('direct_time_conditioning', False)
-            if self.direct_time_conditioning:
-                # 使用 Fourier 编码原始位置 (x)
-                L_pos = config.get('L_embed', 10)
-                self.pos_encoder_direct = FourierRepresentation(input_dim=3, L=L_pos, use_encoding=True)
-                # 解码器：输入 = [pos_enc(x), time_enc(t), dir_enc(d)]
-                self.decoder_direct = NeRFDecoder(
-                    pos_dim=self.pos_encoder_direct.out_dim + self.time_encoder.out_dim,
-                    dir_dim=self.dir_representation.out_dim,
-                    hidden_dim=config.get('hidden_dim', 256),
-                    num_layers=config.get('num_layers', 8),
-                    skip_layer=config.get('skip_layer', 4),
-                    view_dim=config.get('view_dim', 128),
-                )
 
     def forward(self, x, d=None, t=None):
         """
