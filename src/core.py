@@ -125,6 +125,21 @@ class NeuralField(nn.Module):
                     view_dim=config.get('view_dim', 128),
                 )
 
+            self.direct_time_conditioning = config.get('direct_time_conditioning', False)
+            if self.direct_time_conditioning:
+                # 使用 Fourier 编码原始位置 (x)
+                L_pos = config.get('L_embed', 10)
+                self.pos_encoder_direct = FourierRepresentation(input_dim=3, L=L_pos, use_encoding=True)
+                # 解码器：输入 = [pos_enc(x), time_enc(t), dir_enc(d)]
+                self.decoder_direct = NeRFDecoder(
+                    pos_dim=self.pos_encoder_direct.out_dim + self.time_encoder.out_dim,
+                    dir_dim=self.dir_representation.out_dim,
+                    hidden_dim=config.get('hidden_dim', 256),
+                    num_layers=config.get('num_layers', 8),
+                    skip_layer=config.get('skip_layer', 4),
+                    view_dim=config.get('view_dim', 128),
+                )
+
     def forward(self, x, d=None, t=None):
         """
         x: 位置坐标 [N, 2/3]
@@ -135,6 +150,18 @@ class NeuralField(nn.Module):
             if t is None:
                 raise ValueError("Part 3 requires time input 't'.")
             
+            if getattr(self, 'direct_time_conditioning', False):
+                # 直接对原始输入进行编码
+                feat_x = self.pos_encoder_direct(x)      # embed(x)
+                feat_t = self.time_encoder(t)            # embed(t)
+                feat_d = self.dir_representation(d)      # embed(d)
+                # 拼接位置和时间特征
+                h_combined = torch.cat([feat_x, feat_t], dim=-1)
+                rgb, sigma = self.decoder_direct(h_combined, feat_d)
+                # 此模式无变形场，返回 delta_x 为零
+                delta_x = torch.zeros_like(x)
+                return rgb, sigma, delta_x
+
             # ======== A. 坐标噪声增强 ========
             # 在训练阶段给 DeformNet 的输入注入微小噪声
             # 强制模型在 x±ε 范围内输出相似位移，增强变形场平滑性

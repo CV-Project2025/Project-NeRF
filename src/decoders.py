@@ -193,3 +193,69 @@ class DeformationNetwork(BaseDecoder):
         h = torch.cat([x_feat, t_feat], dim=-1)
         delta_x = self.net(h)
         return delta_x
+
+
+class DirectTimeDecoder(BaseDecoder):
+    """
+    直接时间拼接：将 Fourier 编码后的位置、时间和方向特征直接拼接，输入到一个 MLP 中。
+    """
+    def __init__(
+        self,
+        pos_dim,      # 位置编码维度
+        time_dim,     # 时间编码维度
+        dir_dim,      # 方向编码维度
+        hidden_dim=256,
+        num_layers=8,
+        skip_layer=4,
+        output_dim=4, # RGB (3) + Sigma (1)
+    ):
+        super().__init__()
+        self.skip_layer = skip_layer
+        self.pos_dim = pos_dim
+        self.time_dim = time_dim
+        self.dir_dim = dir_dim
+        
+        # 总输入维度 = pos + time + dir
+        input_dim = pos_dim + time_dim + dir_dim
+        
+        # 构建MLP
+        layers = []
+        for i in range(num_layers):
+            if i == 0:
+                in_dim = input_dim
+            else:
+                in_dim = hidden_dim
+                if i == skip_layer:
+                    in_dim += input_dim  # Skip connection
+            
+            out_dim = hidden_dim if i < num_layers - 1 else output_dim
+            layers.append(nn.Linear(in_dim, out_dim))
+            if i < num_layers - 1:
+                layers.append(nn.ReLU())
+        
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x_enc, t_enc, d_enc):
+        """
+        Args:
+            x_enc: [N, pos_dim] 位置编码
+            t_enc: [N, time_dim] 时间编码
+            d_enc: [N, dir_dim] 方向编码
+        Returns:
+            rgb: [N, 3]
+            sigma: [N, 1]
+        """
+        # 直接拼接所有特征
+        h = torch.cat([x_enc, t_enc, d_enc], dim=-1)
+        x_input = h.clone()  # 用于skip connection
+        
+        # 前向传播
+        for i, layer in enumerate(self.net):
+            if isinstance(layer, nn.Linear):
+                if i == self.skip_layer * 2:  # 因为有ReLU，所以索引*2
+                    h = torch.cat([h, x_input], dim=-1)
+            h = layer(h)
+        
+        rgb = torch.sigmoid(h[..., :3])  # [N, 3]
+        sigma = F.relu(h[..., 3:4])      # [N, 1]
+        return rgb, sigma
