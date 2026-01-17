@@ -1,5 +1,16 @@
 # Project-NeRF
 
+本项目实现了从静态到动态场景的完整 NeRF 技术链，包括位置编码、多视图重建、Instant-NGP 加速、D-NeRF 动态建模，以及创新的 Dual-Hash 动态 NeRF 架构。
+
+**测试环境**：代码已在 Ubuntu 22.04 上使用 NVIDIA RTX 4060 Laptop GPU (8GB) 进行测试。实验使用 PyTorch 2.1.2 和 CUDA 12.1，其他版本可能也兼容。
+
+**主要性能**：
+
+- Part 2 (NeRF): Lego 数据集 2达到 24.75 dB PSNR (20k steps)
+- Part 2 (Instant-NeRF): Lego 数据集 5 分钟训练达到 26+ dB，渲染速度 10+ FPS
+- Part 3 (D-NeRF Instant): Standup 数据集达到 28 dB (20k steps, ~2h)
+- Part 4 (Dual-Hash): Standup 数据集达到 30.58 dB (5k steps, ~9 分钟)
+
 ---
 
 ## 1. 资源说明
@@ -20,7 +31,16 @@
 
 ### 2.1 环境配置
 
+本项目已在以下环境测试通过：
+
+- Python 3.10+
+- PyTorch 2.1.2
+- CUDA 12.1 (或 CUDA 11.3+)
+- GPU: 8GB+ 显存 (推荐 RTX 3060 或以上)
+
 #### 基本配置
+
+1. 克隆代码并创建虚拟环境
 
 ```bash
 # 1. 克隆代码
@@ -35,18 +55,18 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-#### Instant-NeRF 依赖安装
+2. TinyCUDA-NN 依赖安装
 
-若要运行 **`Instant-NeRF`** ，请从 [网盘](https://disk.pku.edu.cn/anyshare/zh-cn/link/AAF9F7FDBF0428495A933F2CAFB52E944B/83161E9603DD440884AEA38F67B808E2/84035BCADD4346ED9A22D6EA1AD00CEF/671028B590AA46C7BD1E45E6F4C4B0AF?_tb=none) 下载 `install_ngp.sh` 放置到项目文件夹运行一下，以确保所需的 TinyCUDA-NN 和相关组件正确安装。
+鉴于本项目主要代码运行都要依靠 TinyCUDA-NN ，请从 [网盘](https://disk.pku.edu.cn/anyshare/zh-cn/link/AAF9F7FDBF0428495A933F2CAFB52E944B/83161E9603DD440884AEA38F67B808E2/84035BCADD4346ED9A22D6EA1AD00CEF/671028B590AA46C7BD1E45E6F4C4B0AF?_tb=none) 下载 `install_ngp.sh` 放置到项目文件夹运行一下，以确保所需的 TinyCUDA-NN 和相关组件正确安装。
 
-#### 配置自定义
+3. 配置自定义
 
 将 `configs/part{num}.yaml.example` **复制**一份并重命名为 `configs/part{num}.yaml`，并根据需要修改配置文件中的参数。
 
 ### 2.2 Part 1: 2D 图像拟合
 
 **1. 数据准备**
-将目标图像（如 `fox.jpg`）放入 `data/` 目录。可以使用网盘提供的测试图。
+从[ 网盘 ](https://disk.pku.edu.cn/anyshare/zh-cn/link/AAF9F7FDBF0428495A933F2CAFB52E944B/83161E9603DD440884AEA38F67B808E2/84035BCADD4346ED9A22D6EA1AD00CEF/671028B590AA46C7BD1E45E6F4C4B0AF/A4190D88296E425294F22E88272BAC97/28B0D30C3DB94592A9746E7830F66D92?_tb=none)获取 `fox.jpg`，放置到 `data/` 目录下。
 
 **2. 训练**
 
@@ -54,9 +74,11 @@ pip install -r requirements.txt
 python3 run.py --image data/fox.jpg --config configs/part1.yaml
 ```
 
+训练约 5-10 分钟，PSNR 可达 35+ dB。训练日志实时保存到 TensorBoard。
+
 **3. 测试**
 
-Part 1 训练过程中会自动进行拟合效果渲染。如果需要手动使用 checkpoint，请先从 [网盘](https://disk.pku.edu.cn/link/AAF9F7FDBF0428495A933F2CAFB52E944B) 下载预训练模型，然后运行：
+Part 1 训练过程中会自动进行拟合效果渲染。如果需要手动使用 checkpoint，请先从 [网盘](https://disk.pku.edu.cn/anyshare/zh-cn/link/AAF9F7FDBF0428495A933F2CAFB52E944B/83161E9603DD440884AEA38F67B808E2/84035BCADD4346ED9A22D6EA1AD00CEF/671028B590AA46C7BD1E45E6F4C4B0AF/A4190D88296E425294F22E88272BAC97/AAF7F5188A6B469EBC85B66E8C2D2430?_tb=none) 下载模型 model_final.pth，然后运行：
 
 ```bash
 python3 run.py --image data/fox.jpg --config configs/part1.yaml --checkpoint <path_to_model> --eval_only
@@ -73,7 +95,7 @@ python3 run.py --image data/fox.jpg --config configs/part1.yaml --checkpoint <pa
 
 **1. 数据准备**
 
-建议下载 NeRF Synthetic 数据集，放置在 `data/nerf_synthetic/`下，可以从 [网盘/part2/data](https://disk.pku.edu.cn/anyshare/zh-cn/link/AAF9F7FDBF0428495A933F2CAFB52E944B/83161E9603DD440884AEA38F67B808E2/84035BCADD4346ED9A22D6EA1AD00CEF/671028B590AA46C7BD1E45E6F4C4B0AF/4D12B72493154D28819131CA3144D512/62BB1D321D0C4126889E8503E14E7FB7?_tb=none) 获取。
+建议下载 NeRF Synthetic 数据集，放置在 `data/`下，可以从 [网盘/part2/data](https://disk.pku.edu.cn/anyshare/zh-cn/link/AAF9F7FDBF0428495A933F2CAFB52E944B/83161E9603DD440884AEA38F67B808E2/84035BCADD4346ED9A22D6EA1AD00CEF/671028B590AA46C7BD1E45E6F4C4B0AF/4D12B72493154D28819131CA3144D512/62BB1D321D0C4126889E8503E14E7FB7?_tb=none) 获取。
 
 **2. 训练**
 
@@ -81,9 +103,11 @@ python3 run.py --image data/fox.jpg --config configs/part1.yaml --checkpoint <pa
 python3 run.py --data_dir data/nerf_synthetic/lego --config configs/part2.yaml
 ```
 
+训练 20k steps 约需 2 小时 (batch 4096)。测试集 PSNR 约 24.75 dB。训练日志和 checkpoints 保存在 `output/part2/`。
+
 **3. 测试**
 
-请先从 [网盘](https://disk.pku.edu.cn/link/AAF9F7FDBF0428495A933F2CAFB52E944B) 下载预训练模型并放置到 `output/part2/checkpoints/` 目录下，然后运行：
+请先从 [网盘/part2/result](https://disk.pku.edu.cn/link/AAF9F7FDBF0428495A933F2CAFB52E944B) 下载预训练模型并放置到 `output/part2/checkpoints/` 目录下，然后运行：
 
 ```bash
 python3 run.py --data_dir data/nerf_synthetic/lego --config configs/part2.yaml \
@@ -101,7 +125,7 @@ python3 run.py --data_dir data/nerf_synthetic/lego --config configs/part2.yaml \
 
 **1. 数据准备**
 
-数据同标准 NeRF，注意要保证相关 [依赖](#instant-nerf-依赖安装) 已安装。
+数据同标准 NeRF，注意要保证相关 [依赖](#tinycuda-nn-依赖安装) 已安装。
 
 **2. 训练**
 
@@ -109,9 +133,11 @@ python3 run.py --data_dir data/nerf_synthetic/lego --config configs/part2.yaml \
 python3 run.py --data_dir data/nerf_synthetic/lego --config configs/part2_instant.yaml
 ```
 
+训练速度极快：1 分钟内可见细节，5 分钟达到 26+ dB PSNR。渲染速度 10+ FPS。训练日志保存在 `output/part2_instant/lego/`。
+
 **3. 测试**
 
-请先从 [网盘](https://disk.pku.edu.cn/link/AAF9F7FDBF0428495A933F2CAFB52E944B) 下载预训练模型并放置到 `output/part2_instant/lego/` 目录下，然后运行：
+请先从 [网盘/data/Instant-NeRF result](https://disk.pku.edu.cn/anyshare/zh-cn/link/AAF9F7FDBF0428495A933F2CAFB52E944B/83161E9603DD440884AEA38F67B808E2/84035BCADD4346ED9A22D6EA1AD00CEF/671028B590AA46C7BD1E45E6F4C4B0AF/4D12B72493154D28819131CA3144D512/0A85A9C63ACF47ED9793AA94C8C4C9DB?_tb=none) 下载预训练模型并放置到 `output/part2_instant/lego/` 目录下，然后运行：
 
 ```bash
 # --render_n 参数：-1表示生成视频，正数表示随机渲染指定数量的视角
@@ -142,17 +168,29 @@ python3 run.py --data_dir data/nerf_synthetic/lego --config configs/part2_instan
 ```bash
 # 推荐：Instant 版本（速度最快，效果好）
 python3 run.py --data_dir data/d-nerf/standup --config configs/part3_instant.yaml
+```
 
+训练 20k steps 约 2 小时，测试集 PSNR 约 28 dB。支持多种正则化策略和动态占据网格加速。
+
+```bash
 # 标准版本（收敛慢，需要更长训练时间）
 python3 run.py --data_dir data/d-nerf/standup --config configs/part3.yaml
-
-# Direct Time Conditioning（实验性架构，适合动作简单的场景，几乎无法收敛）
-python3 run.py --data_dir data/d-nerf/standup --config configs/part3_dtc.yaml
 ```
+
+训练 40k steps 约 13 小时，测试集 PSNR 约 25 dB。
+
+```bash
+# Direct Time Conditioning（实验性架构，适合动作简单的场景，几乎无法收敛）
+
+python3 run.py --data_dir data/d-nerf/standup --config configs/part3_dtc.yaml
+
+```
+
+训练 50k steps 约 16 小时，测试集 PSNR 约 23 dB。无变形场解耦，收敛困难。
 
 **3. 测试**
 
-请先从 [网盘](https://disk.pku.edu.cn/link/AAF9F7FDBF0428495A933F2CAFB52E944B) 下载预训练模型并放置到 `output/part3/standup/` 目录下（对应不同配置的模型路径可能不同），然后运行：
+请先从 [网盘/part3/result](https://disk.pku.edu.cn/anyshare/zh-cn/link/AAF9F7FDBF0428495A933F2CAFB52E944B/83161E9603DD440884AEA38F67B808E2/84035BCADD4346ED9A22D6EA1AD00CEF/671028B590AA46C7BD1E45E6F4C4B0AF/B9B86D05DF754D4B8A15C727136F93A0/EE9EB32F95B641CFABCC25D8CD639183?_tb=none) 下载预训练模型并放置到 `output/part3/standup/` 目录下，然后运行：
 
 ```bash
 # --render_n 参数：-1表示生成视频，正数表示随机渲染指定数量的视角
@@ -186,9 +224,11 @@ python3 run.py --data_dir data/d-nerf/standup --config configs/part3_instant.yam
 python3 run.py --data_dir data/d-nerf/standup --config configs/part4.yaml
 ```
 
+训练 5000 steps 仅需约 9 分钟，测试集 PSNR 达到 30.58 dB (训练集 32.41 dB，验证集 29.56 dB)。相比 Part 3 Instant 版本提速 10 倍以上，质量更优且无高频震荡。训练日志和最佳模型保存在 `output/part4/standup/`。
+
 **3. 测试**
 
-请先从 [网盘](https://disk.pku.edu.cn/link/AAF9F7FDBF0428495A933F2CAFB52E944B) 下载预训练模型并放置到 `output/part4/standup/` 目录下，然后运行：
+请先从 [网盘/part4/result](https://disk.pku.edu.cn/anyshare/zh-cn/link/AAF9F7FDBF0428495A933F2CAFB52E944B/83161E9603DD440884AEA38F67B808E2/84035BCADD4346ED9A22D6EA1AD00CEF/671028B590AA46C7BD1E45E6F4C4B0AF/7191F4895A004C469910B6D74ECA854E/6F551E9D714F41C8A7FC7D2FE743160B?_tb=none) 下载预训练模型并放置到 `output/part4/standup/` 目录下，然后运行：
 
 ```bash
 # 只测试 PSNR
