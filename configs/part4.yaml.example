@@ -52,7 +52,7 @@ unsup_n_samples: 512
 # 位移哈希网格
 deform_n_levels: 12
 deform_n_features_per_level: 2
-deform_log2_hashmap_size: 18
+deform_log2_hashmap_size: 16
 deform_base_resolution: 16
 deform_per_level_scale: 1.5
 deform_hidden_dim: 64
@@ -73,7 +73,7 @@ hidden_dim: 64
 
 # 密度网格加速
 use_density_grid: true
-grid_resolution: 128
+grid_resolution: 64
 grid_threshold: 0.01
 grid_warmup_iters: 256
 grid_stop_ratio: 0.9
