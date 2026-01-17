@@ -55,7 +55,8 @@ python3 run.py --image data/fox.jpg --config configs/part1.yaml
 ```
 
 **3. 测试**
-Part 1 训练过程中会自动进行拟合效果渲染。如果需要手动使用 checkpoint，可以运行：
+
+Part 1 训练过程中会自动进行拟合效果渲染。如果需要手动使用 checkpoint，请先从 [网盘](https://disk.pku.edu.cn/link/AAF9F7FDBF0428495A933F2CAFB52E944B) 下载预训练模型，然后运行：
 
 ```bash
 python3 run.py --image data/fox.jpg --config configs/part1.yaml --checkpoint <path_to_model> --eval_only
@@ -82,6 +83,8 @@ python3 run.py --data_dir data/nerf_synthetic/lego --config configs/part2.yaml
 
 **3. 测试**
 
+请先从 [网盘](https://disk.pku.edu.cn/link/AAF9F7FDBF0428495A933F2CAFB52E944B) 下载预训练模型并放置到 `output/part2/checkpoints/` 目录下，然后运行：
+
 ```bash
 python3 run.py --data_dir data/nerf_synthetic/lego --config configs/part2.yaml \
   --checkpoint output/part2/checkpoints/model_step_020000.pth --eval_only
@@ -107,6 +110,8 @@ python3 run.py --data_dir data/nerf_synthetic/lego --config configs/part2_instan
 ```
 
 **3. 测试**
+
+请先从 [网盘](https://disk.pku.edu.cn/link/AAF9F7FDBF0428495A933F2CAFB52E944B) 下载预训练模型并放置到 `output/part2_instant/lego/` 目录下，然后运行：
 
 ```bash
 # --render_n 参数：-1表示生成视频，正数表示随机渲染指定数量的视角
@@ -147,6 +152,8 @@ python3 run.py --data_dir data/d-nerf/standup --config configs/part3_dtc.yaml
 
 **3. 测试**
 
+请先从 [网盘](https://disk.pku.edu.cn/link/AAF9F7FDBF0428495A933F2CAFB52E944B) 下载预训练模型并放置到 `output/part3/standup/` 目录下（对应不同配置的模型路径可能不同），然后运行：
+
 ```bash
 # --render_n 参数：-1表示生成视频，正数表示随机渲染指定数量的视角
 python3 run.py --data_dir data/d-nerf/standup --config configs/part3_instant.yaml \
@@ -180,6 +187,8 @@ python3 run.py --data_dir data/d-nerf/standup --config configs/part4.yaml
 ```
 
 **3. 测试**
+
+请先从 [网盘](https://disk.pku.edu.cn/link/AAF9F7FDBF0428495A933F2CAFB52E944B) 下载预训练模型并放置到 `output/part4/standup/` 目录下，然后运行：
 
 ```bash
 # 只测试 PSNR
