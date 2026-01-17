@@ -600,11 +600,11 @@ def run_part2_instant(cfg, args):
             grid_stop_ratio = cfg.get('grid_stop_ratio', 0.9)
             if step < train_iters * grid_stop_ratio:
                 if step < train_iters * 0.1:
-                    dynamic_interval = 16
+                    dynamic_interval = 32
                 elif step < train_iters * 0.5:
-                    dynamic_interval = 64
+                    dynamic_interval = 128
                 else:
-                    dynamic_interval = 256
+                    dynamic_interval = 512
                 
                 if density_grid is not None and density_grid.should_update(step, dynamic_interval, grid_warmup_iters):
                     model.eval()
@@ -1525,6 +1525,729 @@ def run_part3(cfg, args):
         print(f"!!! 视频生成失败: {e}")
 
 
+def run_part4(cfg, args):
+    """
+    Part 4: Dual-Hash Dynamic NeRF (创新点：哈希位移场 + 哈希规范场)
+    
+    核心创新：
+    1. Dual-Hash 协同架构：用 HashGrid 替代 MLP 变形网络
+    2. TV-Displacement Loss：对位移网格施加全变分正则化
+    3. 时空解耦设计：空间位移由 HashGrid 查询，时间调制由轻量 MLP 完成
+    """
+    if not args.data_dir:
+        raise ValueError("Part 4 requires --data_dir pointing to a dynamic NeRF dataset root.")
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f">>> 使用设备: {device}")
+    print(">>> Part 4: Dual-Hash Dynamic NeRF")
+
+    # 读取渲染和训练配置
+    downscale = cfg.get("downscale", 1)
+    white_bkgd = cfg.get("white_bkgd", True)
+    scene_scale = cfg.get("scene_scale", 1.0)
+    near = float(cfg.get("near", 2.0))
+    far = float(cfg.get("far", 6.0))
+    n_samples = cfg.get("n_samples", 64)
+    render_n_samples = cfg.get("render_n_samples", n_samples)
+    batch_size = cfg.get("batch_size", 4096)
+    train_iters = cfg.get("train_iters", 20000)
+    learning_rate = cfg.get("learning_rate", 5e-4)
+    log_every = cfg.get("log_every", 100)
+    chunk = cfg.get("chunk", 8192)
+    render_n = args.render_n
+    if args.render_chunk is not None:
+        chunk = args.render_chunk
+    log_dir = cfg.get("log_dir", "output/part4")
+    
+    # 获取数据集名称并添加到输出路径
+    dataset_name = os.path.basename(args.data_dir)
+    log_dir = os.path.join(log_dir, dataset_name)
+
+    os.makedirs(log_dir, exist_ok=True)
+    ckpt_dir = os.path.join(log_dir)
+    render_dir = os.path.join(log_dir, "renders")
+    val_render_dir = os.path.join(log_dir, "val_renders")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    os.makedirs(render_dir, exist_ok=True)
+    os.makedirs(val_render_dir, exist_ok=True)
+
+    from src.dataset import DynamicDataset
+    
+    train_set = DynamicDataset(
+        root_dir=args.data_dir,
+        split="train",
+        downscale=downscale,
+        white_bkgd=white_bkgd,
+        scene_scale=scene_scale,
+    )
+    
+    val_set = DynamicDataset(
+        root_dir=args.data_dir,
+        split="val",
+        downscale=downscale,
+        white_bkgd=white_bkgd,
+        scene_scale=scene_scale,
+    )
+    
+    test_split = "test"
+    test_meta = os.path.join(args.data_dir, "transforms_test.json")
+    if not os.path.exists(test_meta):
+        test_split = "val"
+    test_set = DynamicDataset(
+        root_dir=args.data_dir,
+        split=test_split,
+        downscale=downscale,
+        white_bkgd=white_bkgd,
+        scene_scale=scene_scale,
+    )
+    
+    if not args.eval_only:
+        print(f">>> 数据集: 训练集 {len(train_set.images)} 张 | 验证集 {len(val_set.images)} 张 | 测试集 {len(test_set.images)} 张")
+    else:
+        print(f">>> 数据集: 测试集 {len(test_set.images)} 张")
+
+    # 模型初始化
+    from src.core import NeuralField
+    model = NeuralField(cfg).to(device)
+    
+    # 启用 density_grid（与 Part 3 Instant 相同）
+    use_density_grid = cfg.get('use_density_grid', True)
+    density_grid = None
+    active_ratio = 1.0
+    if use_density_grid:
+        from src.renderer import DensityGrid
+        grid_resolution = cfg.get('grid_resolution', 128)
+        grid_threshold = cfg.get('grid_threshold', 0.01)
+        scene_bound = cfg.get('scene_bound', 1.5)
+        density_grid = DensityGrid(
+            resolution=grid_resolution,
+            bound=scene_bound,
+            threshold=grid_threshold
+        ).to(device)
+        print(f">>> Density Grid 已启用: {grid_resolution}³ 分辨率")
+    
+    if args.checkpoint:
+        ckpt = torch.load(args.checkpoint, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        if density_grid is not None and "density_grid" in ckpt:
+            density_grid.load_state_dict(ckpt["density_grid"])
+            # 更新 active_ratio 以反映加载的 density_grid 状态
+            active_ratio = density_grid.binary_grid.float().mean().item()
+        print(f">>> Loaded checkpoint: {args.checkpoint}")
+
+    # =========================================================================
+    # 训练阶段
+    # =========================================================================
+    if not args.eval_only:
+        tb_dir = os.path.join(log_dir, "tensorboard", get_exp_name(cfg))
+        tb_logger = TensorBoardLogger(tb_dir)
+        
+        weight_decay = cfg.get('weight_decay', 1e-5)
+        
+        # ==============================================================
+        # Part 4 分组学习率优化（兼容单网格和三网格模式）
+        # ==============================================================
+        param_groups = []
+        
+        # 1. 三网格模式：分别设置学习率
+        for grid_name in ['deform_grid_start', 'deform_grid_mid', 'deform_grid_end']:
+            if hasattr(model, grid_name):
+                grid = getattr(model, grid_name)
+                param_groups.append({
+                    'params': grid.parameters(),
+                    'lr': learning_rate * 2.0,
+                    'name': grid_name
+                })
+        
+        # 2. 单网格模式兼容（如果没有三网格，使用 deformation_grid）
+        if not hasattr(model, 'deform_grid_start') and hasattr(model, 'deformation_grid'):
+            param_groups.append({
+                'params': model.deformation_grid.parameters(),
+                'lr': learning_rate * 2.0,
+                'name': 'deformation_grid'
+            })
+        
+        # 3. 规范空间哈希网格：高学习率
+        if hasattr(model, 'canonical_repr'):
+            param_groups.append({
+                'params': model.canonical_repr.parameters(),
+                'lr': learning_rate * 2.0,  # 2x 基础学习率
+                'name': 'canonical_repr'
+            })
+        
+        # 3. displacement_scale：超高学习率（标量参数学习慢）
+        if hasattr(model, 'deform_decoder'):
+            param_groups.append({
+                'params': [model.deform_decoder.displacement_scale],
+                'lr': learning_rate * 5.0,  # 5x 基础学习率
+                'name': 'displacement_scale'
+            })
+            # deform_net 用正常学习率
+            param_groups.append({
+                'params': [p for n, p in model.deform_decoder.named_parameters() if 'displacement_scale' not in n],
+                'lr': learning_rate,
+                'name': 'deform_decoder'
+            })
+        
+        # 4. 其他参数（时间调制、解码器等）：正常学习率
+        excluded_names = {'deform_grid_start', 'deform_grid_mid', 'deform_grid_end', 
+                         'deformation_grid', 'canonical_repr', 'deform_decoder'}
+        other_params = [p for n, p in model.named_parameters() 
+                       if not any(ex in n for ex in excluded_names)]
+        if other_params:
+            param_groups.append({
+                'params': other_params,
+                'lr': learning_rate,
+                'name': 'others'
+            })
+        
+        optimizer = optim.AdamW(param_groups, weight_decay=weight_decay)
+        
+        eta_min = cfg.get('eta_min', 1e-4)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=train_iters, eta_min=eta_min)
+        
+        use_amp = cfg.get('use_amp', True)
+        scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+        
+        loss_fn = nn.MSELoss()
+        
+        # ==============================================================================
+        # 正则化配置
+        # ==============================================================================
+        
+        # 1. TV-Displacement Loss（核心创新）
+        # 对位移哈希网格施加全变分正则化，强制相邻格点位移一致
+        use_tv_displacement = cfg.get('use_tv_displacement', True)
+        tv_displacement_weight = cfg.get('tv_displacement_weight', 0.001)
+        
+        # 2. 规范空间 TV Loss
+        tv_loss_weight = cfg.get('tv_loss_weight', 1e-5)
+        
+        # 3. 变形场 L2 正则化
+        deformation_reg_weight = cfg.get('deformation_reg_weight', 0.01)
+        
+        # 4. 时间平滑正则化
+        use_temporal_smooth = cfg.get('use_temporal_smooth', True)
+        temporal_smooth_weight = cfg.get('temporal_smooth_weight', 1e-4)
+        temporal_epsilon = cfg.get('temporal_epsilon', 0.02)
+        temporal_n_samples = cfg.get('temporal_n_samples', 256)
+        
+        # 5. 随机背景增强
+        use_random_bg = cfg.get('use_random_bg', False)
+        random_bg_start = cfg.get('random_bg_start', 0) if use_random_bg else float('inf')
+        
+        # 6. 无监督一致性约束
+        use_unsup_consistency = cfg.get('use_unsupervised_consistency', False)
+        unsup_consistency_weight = cfg.get('unsup_consistency_weight', 0.001)
+        unsup_n_samples = cfg.get('unsup_n_samples', 512)
+        
+        # 7. 静态锚点损失（强制 t=0 时零位移）
+        use_static_anchor = cfg.get('use_static_anchor', True)
+        static_anchor_weight = cfg.get('static_anchor_weight', 0.01)
+        static_anchor_n_samples = cfg.get('static_anchor_n_samples', 512)
+        
+        # 打印配置
+        print(">>> 开始训练 Part 4 (Dual-Hash Dynamic NeRF)...")
+        print(f">>> tensorboard --logdir={os.path.join(log_dir, 'tensorboard')} 查看日志")
+        if use_tv_displacement:
+            print(f">>> 正则化: TV-Displacement Loss 已启用 (weight={tv_displacement_weight:.0e})")
+        if tv_loss_weight > 0:
+            print(f">>> 正则化: 规范空间 TV Loss (weight={tv_loss_weight:.0e})")
+        if use_temporal_smooth:
+            print(f">>> 正则化: 时间平滑 (weight={temporal_smooth_weight:.0e}, ε={temporal_epsilon})")
+        if use_static_anchor:
+            print(f">>> 正则化: 静态锚点损失已启用 (weight={static_anchor_weight:.0e}, t=0 时强制零位移)")
+        if use_random_bg:
+            print(f">>> 数据增强: 随机背景 ({random_bg_start} 步后开启)")
+        if cfg.get('use_coord_noise', False):
+            print(f">>> 数据增强: 坐标噪声 (coord={cfg.get('coord_noise_std', 0.005)}, time={cfg.get('time_noise_std', 0.02)})")
+        
+        best_val_psnr = 0.0
+        model.train()
+        grid_update_interval = cfg.get('grid_update_interval', 32)
+        grid_warmup_iters = cfg.get('grid_warmup_iters', 256)
+        
+        for step in range(1, train_iters + 1):
+            rays_o, rays_d, target_rgba, times = train_set.sample_random_rays(batch_size, device)
+            
+            target_rgb = target_rgba[:, :3]
+            target_alpha = target_rgba[:, 3:4]
+            
+            # 随机背景
+            if use_random_bg and step >= random_bg_start:
+                bg_color = torch.rand(3, device=device)
+            else:
+                bg_color = torch.ones(3, device=device) if white_bkgd else torch.zeros(3, device=device)
+            
+            target = target_rgb * target_alpha + bg_color * (1.0 - target_alpha)
+            
+            with torch.amp.autocast('cuda', enabled=use_amp):
+                pred_rgb, _, _, extras = render_rays(
+                    model=model,
+                    rays_o=rays_o,
+                    rays_d=rays_d,
+                    near=near,
+                    far=far,
+                    n_samples=n_samples,
+                    perturb=True,
+                    times=times,
+                    density_grid=density_grid,
+                    bg_color=bg_color,
+                )
+                
+                # A. RGB Loss
+                loss_rgb = loss_fn(pred_rgb, target)
+                
+                # B. 变形场 L2 正则化
+                mean_delta_x = extras['mean_delta_x']
+                loss_reg = torch.mean(mean_delta_x ** 2) * deformation_reg_weight
+                
+
+                #  TV-Displacement Loss
+                # 对位移哈希网格的参数施加全变分正则化，强制相邻哈希条目的位移向量相似，消除边缘闪烁
+                loss_tv_disp = torch.tensor(0.0, device=device)
+                if use_tv_displacement:
+                    # 三网格 TV Loss：对三个锚点网格分别施加 TV 正则化
+                    tv_total = 0.0
+                    for grid_name in ['deform_grid_start', 'deform_grid_mid', 'deform_grid_end']:
+                        if hasattr(model, grid_name):
+                            grid = getattr(model, grid_name)
+                            params = grid.encoding.params
+                            tv_diff = torch.abs(params[1:] - params[:-1])
+                            tv_total = tv_total + torch.mean(tv_diff)
+                    loss_tv_disp = tv_total * tv_displacement_weight / 3.0  # 平均
+                
+                # D. 规范空间 TV Loss
+                loss_tv_canon = torch.tensor(0.0, device=device)
+                if tv_loss_weight > 0 and hasattr(model, 'canonical_repr'):
+                    canon_params = model.canonical_repr.encoding.params
+                    tv_diff_canon = torch.abs(canon_params[1:] - canon_params[:-1])
+                    loss_tv_canon = torch.mean(tv_diff_canon) * tv_loss_weight
+                
+                # E. 时间平滑正则化（每 16 步计算一次，大幅减少开销）
+                loss_temporal = torch.tensor(0.0, device=device)
+                if use_temporal_smooth and step > grid_warmup_iters and step % 16 == 0:
+                    n_temp = 64  # 减少采样点数
+                    scene_bound = cfg.get('scene_bound', 1.5)
+                    
+                    x_temp = (torch.rand(n_temp, 3, device=device) * 2 - 1) * scene_bound
+                    t_temp = torch.rand(n_temp, 1, device=device) * (1.0 - temporal_epsilon)
+                    t_temp_eps = t_temp + temporal_epsilon
+                    
+                    # Part 4 使用哈希位移场
+                    feat_t = model.time_encoder(t_temp)
+                    feat_t_eps = model.time_encoder(t_temp_eps)
+                    time_mod = model.time_modulation(feat_t)
+                    time_mod_eps = model.time_modulation(feat_t_eps)
+                    
+                    deform_feat = model.deformation_grid(x_temp)
+                    delta_x_t = model.deform_decoder(deform_feat, time_mod)
+                    delta_x_t_eps = model.deform_decoder(deform_feat, time_mod_eps)
+                    
+                    loss_temporal = torch.mean((delta_x_t - delta_x_t_eps) ** 2) * temporal_smooth_weight * 16  # 补偿采样频率
+                
+                # F. 无监督一致性约束（每 32 步计算一次）
+                loss_unsup = torch.tensor(0.0, device=device)
+                if use_unsup_consistency and step > grid_warmup_iters and step % 32 == 0:
+                    n_unsup = 128  # 减少采样点数
+                    t_rand = torch.rand(n_unsup, 1, device=device)
+                    scene_bound = cfg.get('scene_bound', 1.5)
+                    x_rand = (torch.rand(n_unsup, 3, device=device) * 2 - 1) * scene_bound
+                    
+                    feat_t_rand = model.time_encoder(t_rand)
+                    time_mod_rand = model.time_modulation(feat_t_rand)
+                    deform_feat_rand = model.deformation_grid(x_rand)
+                    delta_x_rand = model.deform_decoder(deform_feat_rand, time_mod_rand)
+                    
+                    loss_unsup = torch.mean(torch.abs(delta_x_rand.mean(dim=0))) * unsup_consistency_weight * 32  # 补偿采样频率
+                
+                # ==============================================================
+                # ⭐ 三网格锚点约束 (Tri-Grid Anchor Loss)
+                # 对三个网格在各自的锚点时刻施加约束：
+                #   - Grid_start: t=0 时强制零位移（定义规范空间）
+                #   - Grid_mid:   t=1/2 时位移应平滑连续
+                #   - Grid_end:   t=1 时无特殊约束（非循环场景）
+                # ==============================================================
+                loss_anchor = torch.tensor(0.0, device=device)
+                if use_static_anchor and step > grid_warmup_iters and step % 16 == 0:
+                    n_anchor = 128
+                    scene_bound = cfg.get('scene_bound', 1.5)
+                    
+                    # 随机采样空间点
+                    x_anchor = (torch.rand(n_anchor, 3, device=device) * 2 - 1) * scene_bound
+                    
+                    # ======== 1. t=0 强制零位移（核心约束）========
+                    # t=0 落在 [0, 1/6] 段，100% 使用 Grid_start
+                    t_zero = torch.zeros(n_anchor, 1, device=device)
+                    feat_t_zero = model.time_encoder(t_zero)
+                    time_mod_zero = model.time_modulation(feat_t_zero)
+                    deform_feat_start = model.deform_grid_start(x_anchor)
+                    delta_x_zero = model.deform_decoder(deform_feat_start, time_mod_zero)
+                    loss_start = torch.mean(delta_x_zero ** 2)
+                    
+                    # ======== 2. 三网格一致性约束（可选）========
+                    # 让三个网格在 t=1/6 时刻输出相近的特征，确保插值过渡平滑
+                    # 这是软约束，权重较小
+                    t_anchor = torch.full((n_anchor, 1), 1.0/6.0, device=device)
+                    feat_t_anchor = model.time_encoder(t_anchor)
+                    time_mod_anchor = model.time_modulation(feat_t_anchor)
+                    
+                    # 在 t=1/6 时，start 和 mid 网格应该有相似的"趋势"
+                    delta_start_anchor = model.deform_decoder(model.deform_grid_start(x_anchor), time_mod_anchor)
+                    delta_mid_anchor = model.deform_decoder(model.deform_grid_mid(x_anchor), time_mod_anchor)
+                    # 软约束：两个网格在边界时刻的输出差异不要太大
+                    loss_consistency = torch.mean((delta_start_anchor - delta_mid_anchor) ** 2) * 0.1
+                    
+                    # 总锚点损失
+                    loss_anchor = (loss_start + loss_consistency) * static_anchor_weight * 16
+                
+                total_loss = loss_rgb + loss_reg + loss_tv_disp + loss_tv_canon + loss_temporal + loss_unsup + loss_anchor
+
+            optimizer.zero_grad()
+            scaler.scale(total_loss).backward()
+            
+            max_grad_norm = cfg.get('max_grad_norm', 1.0)
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+            
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+            
+            # 分离 loss 值
+            loss_rgb_val = loss_rgb.item()
+            loss_reg_val = loss_reg.item()
+            loss_tv_disp_val = loss_tv_disp.item() if use_tv_displacement else 0.0
+            loss_tv_canon_val = loss_tv_canon.item() if tv_loss_weight > 0 else 0.0
+            loss_temporal_val = loss_temporal.item() if use_temporal_smooth else 0.0
+            loss_unsup_val = loss_unsup.item() if use_unsup_consistency else 0.0
+            loss_anchor_val = loss_anchor.item() if use_static_anchor else 0.0
+            total_loss_val = total_loss.item()
+            
+            del extras
+            
+            # 动态网格更新
+            if step < train_iters * 0.1:
+                dynamic_interval = 16
+            elif step < train_iters * 0.5:
+                dynamic_interval = 64
+            else:
+                dynamic_interval = 256
+            
+            grid_stop_ratio = cfg.get('grid_stop_ratio', 0.9)
+            if density_grid is not None and step < train_iters * grid_stop_ratio and density_grid.should_update(step, dynamic_interval, grid_warmup_iters):
+                model.eval()
+                # ⭐ 三网格架构：只需采样三个锚点时刻即可覆盖运动轨迹
+                # 避免过度采样导致 Skip 率暴跌
+                anchor_times = torch.tensor([1.0/6.0, 0.5, 5.0/6.0], device=device)
+                
+                # 每 500 步启用自动剪枝，避免 Skip 率暴跌
+                enable_prune = (step % 500 == 0) and (step > grid_warmup_iters)
+                
+                for t_val in anchor_times:
+                    active_ratio = density_grid.update(
+                        model, device=device, time=t_val.view(1, 1), decay=1.0,
+                        auto_prune=enable_prune, threshold_multiplier=1.0
+                    )
+                model.train()
+
+            if step % log_every == 0:
+                psnr = compute_psnr(loss_rgb_val)
+                current_lr = scheduler.get_last_lr()[0]
+                skip_info = f" | Skip: {(1-active_ratio)*100:.1f}%" if density_grid else ""
+                
+                print(
+                    f">>> Step {step}/{train_iters} | "
+                    f"Loss {total_loss_val:.6f} | "
+                    f"PSNR {psnr:.2f} dB | "
+                    f"LR {current_lr:.6f}{skip_info}"
+                )
+                
+                tb_logger.log_scalar('Train/RGB_Loss', loss_rgb_val, step)
+                tb_logger.log_scalar('Train/Reg_Loss', loss_reg_val, step)
+                tb_logger.log_scalar('Train/Total_Loss', total_loss_val, step)
+                tb_logger.log_scalar('Train/PSNR', psnr, step)
+                tb_logger.log_scalar('Train/LearningRate', current_lr, step)
+                if use_tv_displacement:
+                    tb_logger.log_scalar('Train/TV_Displacement_Loss', loss_tv_disp_val, step)
+                if tv_loss_weight > 0:
+                    tb_logger.log_scalar('Train/TV_Canon_Loss', loss_tv_canon_val, step)
+                if use_temporal_smooth:
+                    tb_logger.log_scalar('Train/Temporal_Loss', loss_temporal_val, step)
+                if use_unsup_consistency:
+                    tb_logger.log_scalar('Train/Unsup_Loss', loss_unsup_val, step)
+                if use_static_anchor:
+                    tb_logger.log_scalar('Train/Anchor_Loss', loss_anchor_val, step)
+                if density_grid is not None:
+                    tb_logger.log_scalar('Train/ActiveRatio', active_ratio, step)
+            
+            # 验证集评估
+            val_every = cfg.get("val_every", 500)
+            if step % val_every == 0:
+                model.eval()
+                val_psnrs = []
+                
+                import random
+                n_save_images = min(5, len(val_set.images))
+                save_indices = set(random.sample(range(len(val_set.images)), n_save_images))
+                
+                step_val_dir = os.path.join(val_render_dir, f"step_{step:06d}")
+                os.makedirs(step_val_dir, exist_ok=True)
+                
+                with torch.no_grad():
+                    val_bg_color = torch.ones(3, device=device) if white_bkgd else torch.zeros(3, device=device)
+                    
+                    for idx in range(len(val_set.images)):
+                        rays_o, rays_d, target, time = val_set.get_image_rays(idx, device)
+                        H, W = rays_o.shape[:2]
+                        rays_o = rays_o.reshape(-1, 3)
+                        rays_d = rays_d.reshape(-1, 3)
+                        target_flat = target.reshape(-1, 3)
+                        time = time.expand(H*W, 1)
+                        
+                        pred_chunks = []
+                        for i in range(0, rays_o.shape[0], chunk):
+                            pred_chunk, _, _, _ = render_rays(
+                                model=model,
+                                rays_o=rays_o[i:i+chunk],
+                                rays_d=rays_d[i:i+chunk],
+                                near=near,
+                                far=far,
+                                n_samples=render_n_samples,
+                                perturb=False,
+                                times=time[i:i+chunk],
+                                density_grid=density_grid,
+                                bg_color=val_bg_color,
+                            )
+                            pred_chunks.append(pred_chunk.cpu())
+                        pred = torch.cat(pred_chunks, dim=0)
+                        del pred_chunks
+                        
+                        val_psnr = compute_psnr_torch(pred.to(device), target_flat)
+                        val_psnrs.append(val_psnr)
+                        
+                        if idx in save_indices:
+                            pred_img = pred.reshape(H, W, 3)
+                            pred_img = torch.clamp(pred_img, 0.0, 1.0)
+                            plt.imsave(
+                                os.path.join(step_val_dir, f"val_{idx:03d}_t{time[0,0].item():.2f}_psnr{val_psnr:.2f}.png"),
+                                pred_img.numpy(),
+                            )
+                        del pred, target_flat, rays_o, rays_d
+                
+                avg_val_psnr = float(np.mean(val_psnrs))
+                print(f"    [Validation] PSNR: {avg_val_psnr:.2f} dB", end="")
+                
+                tb_logger.log_scalar('Validation/PSNR', avg_val_psnr, step)
+                
+                plt.close('all')
+                if device.type == 'cuda':
+                    torch.cuda.empty_cache()
+                
+                if avg_val_psnr > best_val_psnr:
+                    best_val_psnr = avg_val_psnr
+                    best_path = os.path.join(ckpt_dir, f"best_model.pth")
+                    save_dict = {
+                        "model_state_dict": model.state_dict(),
+                        "config": cfg,
+                        "step": step,
+                        "val_psnr": best_val_psnr
+                    }
+                    if density_grid is not None:
+                        save_dict["density_grid"] = density_grid.state_dict()
+                    torch.save(save_dict, best_path)
+                    print(f" | 🌟 New Best! Saved to {best_path}")
+                else:
+                    print()
+                
+                model.train()
+
+        print(f"\n>>> 训练完成！最佳验证集 PSNR: {best_val_psnr:.2f} dB")
+        tb_logger.close()
+        
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # =========================================================================
+    # 评估阶段（与 Part 3 相同的视频渲染逻辑）
+    # =========================================================================
+    import shutil
+    import subprocess
+    from scipy.spatial.transform import Rotation, Slerp
+    from scipy.interpolate import interp1d
+    
+    del train_set, val_set
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    model.eval()
+    eval_bg_color = torch.ones(3, device=device) if white_bkgd else torch.zeros(3, device=device)
+    
+    picture_dir = os.path.join(log_dir, "picture")
+    os.makedirs(picture_dir, exist_ok=True)
+    
+    if render_n == -1:
+        n_interp_frames = cfg.get('video_frames', 300)
+        n_rotations = cfg.get('n_rotations', 2)
+        print(f">>> 环绕渲染模式: 生成 {n_interp_frames} 帧，相机绕物体旋转 {n_rotations} 圈...")
+        
+        radius = cfg.get('camera_radius', 2.4)
+        scene_center = cfg.get('scene_center', [0.0, 0.0, 0.0])
+        camera_height = cfg.get('camera_height', 2.8)
+        center = np.array(scene_center)
+        
+        print(f">>> 环绕半径: {radius:.3f}, 场景中心: {center}, 相机高度: {camera_height:.2f}")
+        
+        interp_times = np.linspace(0.0, 1.0, n_interp_frames)
+        angles = np.linspace(0.0, n_rotations * 2 * np.pi, n_interp_frames, endpoint=False)
+        
+        interp_poses = np.zeros((n_interp_frames, 4, 4), dtype=np.float32)
+        for i, angle in enumerate(angles):
+            x = center[0] + radius * np.cos(angle)
+            y = center[1] + radius * np.sin(angle)
+            z = camera_height
+            cam_pos = np.array([x, y, z])
+            
+            forward = center - cam_pos
+            forward = forward / np.linalg.norm(forward)
+            world_up = np.array([0.0, 0.0, 1.0])
+            right = np.cross(forward, world_up)
+            right = right / (np.linalg.norm(right) + 1e-8)
+            up = np.cross(right, forward)
+            up = up / np.linalg.norm(up)
+            
+            R = np.stack([right, up, -forward], axis=1)
+            interp_poses[i, :3, :3] = R
+            interp_poses[i, :3, 3] = cam_pos
+            interp_poses[i, 3, 3] = 1.0
+        
+        H, W = test_set.H, test_set.W
+        focal = test_set.focal
+        
+        with torch.no_grad():
+            for idx in tqdm(range(n_interp_frames), desc="Rendering"):
+                c2w = torch.tensor(interp_poses[idx], dtype=torch.float32, device=device)
+                t = torch.tensor([[interp_times[idx]]], dtype=torch.float32, device=device)
+                
+                j, i = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
+                dirs = torch.stack([
+                    (i - W * 0.5) / focal,
+                    -(j - H * 0.5) / focal,
+                    -torch.ones_like(i),
+                ], dim=-1).reshape(-1, 3)
+                
+                rays_d = torch.matmul(dirs, c2w[:3, :3].T)
+                rays_d = rays_d / torch.norm(rays_d, dim=-1, keepdim=True)
+                rays_o = c2w[:3, 3].expand_as(rays_d)
+                if test_set.scene_scale != 1.0:
+                    rays_o = rays_o * test_set.scene_scale
+                
+                time_batch = t.expand(H*W, 1)
+                
+                pred_chunks = []
+                for i in range(0, rays_o.shape[0], chunk):
+                    pred_chunk, _, _, _ = render_rays(
+                        model=model,
+                        rays_o=rays_o[i:i+chunk],
+                        rays_d=rays_d[i:i+chunk],
+                        near=near,
+                        far=far,
+                        n_samples=render_n_samples,
+                        perturb=False,
+                        times=time_batch[i:i+chunk],
+                        density_grid=density_grid,
+                        bg_color=eval_bg_color,
+                    )
+                    pred_chunks.append(pred_chunk)
+                
+                pred = torch.cat(pred_chunks, dim=0).reshape(H, W, 3)
+                pred = torch.clamp(pred, 0.0, 1.0)
+                
+                plt.imsave(
+                    os.path.join(picture_dir, f"frame_{idx:03d}.png"),
+                    pred.cpu().numpy(),
+                )
+                
+                del pred, pred_chunks, rays_o, rays_d, time_batch, c2w, t, dirs
+                torch.cuda.empty_cache()
+        
+        print(f">>> 渲染完成！共 {n_interp_frames} 帧")
+        psnrs = []
+    else:
+        print(f">>> Rendering {test_split} set...")
+        psnrs = []
+        num_renders = min(render_n, len(test_set))
+        
+        with torch.no_grad():
+            for idx in tqdm(range(num_renders), desc="Rendering"):
+                rays_o, rays_d, target, time = test_set.get_image_rays(idx, device)
+                H, W = rays_o.shape[:2]
+                rays_o = rays_o.reshape(-1, 3)
+                rays_d = rays_d.reshape(-1, 3)
+                time = time.expand(H*W, 1)
+
+                pred_chunks = []
+                for i in range(0, rays_o.shape[0], chunk):
+                    pred_chunk, _, _, _ = render_rays(
+                        model=model,
+                        rays_o=rays_o[i:i+chunk],
+                        rays_d=rays_d[i:i+chunk],
+                        near=near,
+                        far=far,
+                        n_samples=render_n_samples,
+                        perturb=False,
+                        times=time[i:i+chunk],
+                        density_grid=density_grid,
+                        bg_color=eval_bg_color,
+                    )
+                    pred_chunks.append(pred_chunk)
+                
+                pred = torch.cat(pred_chunks, dim=0).reshape(H, W, 3)
+                pred = torch.clamp(pred, 0.0, 1.0)
+                psnr = compute_psnr_torch(pred, target)
+                psnrs.append(psnr)
+                
+                plt.imsave(os.path.join(picture_dir, f"frame_{idx:03d}.png"), pred.cpu().numpy())
+                plt.imsave(os.path.join(render_dir, f"{test_split}_{idx:03d}_t{time[0,0].item():.2f}.png"), pred.cpu().numpy())
+                
+                del pred, pred_chunks, rays_o, rays_d, target, time
+                torch.cuda.empty_cache()
+        
+        n_interp_frames = num_renders
+
+    avg_psnr = float(np.mean(psnrs)) if psnrs else 0.0
+    if psnrs:
+        print(f"\n>>> Test PSNR: {avg_psnr:.2f} dB")
+    print(f">>> Rendered images saved to: {picture_dir}")
+    
+    # 生成视频
+    dataset_name = os.path.basename(args.data_dir)
+    video_path = os.path.join(log_dir, f"{dataset_name}_part4_24fps.mp4")
+    print(f"\n>>> 使用 ffmpeg 生成视频...")
+    try:
+        cmd = [
+            "ffmpeg", "-y",
+            "-framerate", "24",
+            "-i", os.path.join(picture_dir, "frame_%03d.png"),
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-crf", "18",
+            video_path
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            print(f">>> 视频已保存: {video_path}")
+            print(f">>> 视频时长: {n_interp_frames/24:.1f}秒 ({n_interp_frames} 帧 @ 24fps)")
+            shutil.rmtree(picture_dir)
+            print(f">>> 已清理临时图片目录")
+        else:
+            print(f"!!! ffmpeg 执行失败:\n{result.stderr}")
+    except FileNotFoundError:
+        print("!!! 未找到 ffmpeg，请先安装: sudo apt install ffmpeg")
+    except Exception as e:
+        print(f"!!! 视频生成失败: {e}")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--image", type=str, help="输入图像路径 (Part 1)")
@@ -1560,5 +2283,9 @@ if __name__ == "__main__":
         if args.eval_only and not args.checkpoint:
             raise ValueError("eval_only requires --checkpoint.")
         run_part3(cfg, args)
+    elif mode == "part4":
+        if args.eval_only and not args.checkpoint:
+            raise ValueError("eval_only requires --checkpoint.")
+        run_part4(cfg, args)
     else:
         raise ValueError(f"Unsupported mode: {mode}")
