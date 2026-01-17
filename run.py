@@ -75,6 +75,31 @@ def run_part1(cfg, args):
 
     loss_fn = nn.MSELoss()
 
+    if args.eval_only:
+        ckpt = torch.load(args.checkpoint, map_location=device)
+        ckpt_cfg = ckpt.get("config", cfg)
+        model = NeuralField(ckpt_cfg).to(device)
+        load_result = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        if load_result.missing_keys or load_result.unexpected_keys:
+            print(f">>> Warning: load_state_dict missing={load_result.missing_keys}, "
+                  f"unexpected={load_result.unexpected_keys}")
+        model.eval()
+        with torch.no_grad():
+            pred = model(coords)
+            pred = torch.clamp(pred, 0.0, 1.0)
+            loss = loss_fn(pred, gt_rgb).item()
+            psnr = compute_psnr(loss)
+            final_img = pred.cpu().numpy().reshape(h, w, 3)
+
+        eval_dir = os.path.join(log_dir, "eval")
+        os.makedirs(eval_dir, exist_ok=True)
+        ckpt_name = os.path.splitext(os.path.basename(args.checkpoint))[0]
+        out_path = os.path.join(eval_dir, f"{ckpt_name}.png")
+        plt.imsave(out_path, final_img)
+        print(f">>> Eval PSNR: {psnr:.2f} dB")
+        print(f">>> Rendered image saved to: {out_path}")
+        return
+
     total_pixels = coords.shape[0]
     print(">>> Start Training Part 1 (2D Fitting)...")
     print(
@@ -497,9 +522,9 @@ def run_part2_instant(cfg, args):
         model.load_state_dict(ckpt["model_state_dict"])
         if density_grid is not None and "density_grid" in ckpt:
             density_grid.load_state_dict(ckpt["density_grid"])
-            print(f">>> Loaded checkpoint with DensityGrid: {args.checkpoint} (Step {ckpt.get("step", "未知")} | Val PSNR {ckpt.get("val_psnr", None):.2f} dB)")
+            print(f">>> Loaded checkpoint with DensityGrid: {args.checkpoint} (Step {ckpt.get('step', '未知')} | Val PSNR {ckpt.get('val_psnr', None):.2f} dB)")
         else:
-            print(f">>> Loaded checkpoint: {args.checkpoint} (Step {ckpt.get("step", "未知")} | Val PSNR {ckpt.get("val_psnr", None):.2f} dB)")
+            print(f">>> Loaded checkpoint: {args.checkpoint} (Step {ckpt.get('step', '未知')} | Val PSNR {ckpt.get('val_psnr', None):.2f} dB)")
 
     # 训练阶段
     if not args.eval_only:
@@ -2303,11 +2328,11 @@ if __name__ == "__main__":
     parser.add_argument("--image", type=str, help="输入图像路径 (Part 1)")
     parser.add_argument("--data_dir", type=str, help="NeRF 数据集根目录 (Part 2)")
     parser.add_argument("--config", type=str, required=True, help="配置文件路径")
-    parser.add_argument("--checkpoint", type=str, help="加载 Part 2 已训练模型")
+    parser.add_argument("--checkpoint", type=str, help="加载已训练模型")
     parser.add_argument(
         "--eval_only",
         action="store_true",
-        help="仅渲染测试集，不进行训练（需 --checkpoint）",
+        help="仅评估/渲染，不进行训练（需 --checkpoint）",
     )
     parser.add_argument("--render_n", type=int, default=-1, help="评估时渲染的测试集图片数量，如果为 -1 则插值渲染 300 帧") 
     parser.add_argument("--render_chunk", type=int, help="覆盖渲染 chunk 大小")
@@ -2320,6 +2345,8 @@ if __name__ == "__main__":
     if mode == "part1_fourier":
         if not args.image:
             raise ValueError("Part 1 requires --image.")
+        if args.eval_only and not args.checkpoint:
+            raise ValueError("Part 1 eval_only requires --checkpoint.")
         run_part1(cfg, args)
     elif mode == "part2_nerf":
         if args.eval_only and not args.checkpoint:
