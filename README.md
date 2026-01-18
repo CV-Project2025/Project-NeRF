@@ -2,6 +2,8 @@
 
 本项目实现了从静态到动态场景的完整 NeRF 技术链，包括位置编码、多视图重建、Instant-NGP 加速、D-NeRF 动态建模，以及创新的 Dual-Hash 动态 NeRF 架构。
 
+**项目完整报告**: [Final Report](/Report.pdf)
+
 **测试环境**：代码已在 Ubuntu 22.04 上使用 NVIDIA RTX 4060 Laptop GPU (8GB) 进行测试。实验使用 PyTorch 2.1.2 和 CUDA 12.1，其他版本可能也兼容。
 
 **主要性能**：
@@ -17,13 +19,11 @@
 
 #### 项目网盘
 
-[这里](https://disk.pku.edu.cn/link/AAF9F7FDBF0428495A933F2CAFB52E944B) 存放了部分数据集和预训练模型，结果。
+[北大网盘](https://disk.pku.edu.cn/link/AAF9F7FDBF0428495A933F2CAFB52E944B) 存放了项目的数据集和预训练模型，结果。
 
 #### 项目报告
 
-[milestone](https://latex.pku.edu.cn/project/6954fa6e57c9c512c3b063aa)
-
-[report](https://latex.pku.edu.cn/7474895241mkhtrdjqsctt#529d39)
+1、[milestone](https://latex.pku.edu.cn/project/6954fa6e57c9c512c3b063aa) &nbsp;&nbsp;&nbsp;&nbsp;2、[final report](https://latex.pku.edu.cn/7474895241mkhtrdjqsctt#529d39)
 
 ---
 
@@ -33,10 +33,10 @@
 
 本项目已在以下环境测试通过：
 
-- Python 3.10+
+- Python 3.13
 - PyTorch 2.1.2
-- CUDA 12.1 (或 CUDA 11.3+)
-- GPU: 8GB+ 显存 (推荐 RTX 3060 或以上)
+- CUDA 12.1
+- GPU: 8GB 显存 (RTX 4060 laptop)
 
 #### 基本配置
 
@@ -261,6 +261,9 @@ Project-NeRF/
 │   ├── part3_dtc.yaml.example          # Dynamic NeRF Direct Time Conditioning
 │   └── part4.yaml.example              # Dual-Hash Dynamic NeRF
 ├── data/                   # 数据存放目录
+│   ├── d-nerf/             # D-NeRF 动态场景数据集 (Part 3 & 4)
+│   ├── nerf_synthetic/     # NeRF Synthetic 静态场景数据集 (Part 2)
+│   └── part1/              # Part 1 2D 拟合数据 (如 fox.jpg)
 ├── output/                 # 实验输出 (日志, checkpionts, 渲染图)
 ├── src/                    # 核心代码
 │   ├── __init__.py
