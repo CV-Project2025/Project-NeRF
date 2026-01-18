@@ -2158,7 +2158,6 @@ def run_part4(cfg, args):
         print(f">>> Part 4 测试集评估结果")
         print(f">>> 平均 PSNR: {avg_psnr:.2f} dB ({len(psnrs)} 张图片)")
         print(f"{'='*60}")
-        return
     
     # 训练模式结束后直接返回，不生成视频
     if not args.eval_only:
